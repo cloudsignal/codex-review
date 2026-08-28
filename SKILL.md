@@ -80,13 +80,13 @@ spend.
 
 ## The fix loop (iterate to zero)
 
-Codex is a **second, independent reviewer** — one that did not write the code — so it is good at
+Codex is a **second, independent reviewer** (one that did not write the code), so it is good at
 catching oversights and reasoning about correctness the author's own pass misses. Get the value by
 looping to zero findings, not by taking one round as the verdict:
 
 1. Run a first round (`--kind implementation --topic my-feature`).
 2. Read the findings, apply the ones you agree with, and **push back with technical reasoning where
-   the reviewer is wrong** — a real fix or a justified rebuttal, never a silent skip.
+   the reviewer is wrong**: a real fix or a justified rebuttal, never a silent skip.
 3. Run `--kind fix-round --topic my-feature --ask "fixed 1,3,4; pushed back on 2 because…"`. The
    reviewer re-checks each earlier finding against the current tree and surfaces anything new.
 4. Repeat until a round returns nothing. In practice a topic converges in **roughly 6 rounds**;
@@ -94,7 +94,7 @@ looping to zero findings, not by taking one round as the verdict:
 
 Under spec-driven development, review each stage on its own topic as it is ready: the **plan**
 (`--kind plan`), then the **design** (`--kind design`), then the **implementation**
-(`--kind implementation`) — looping each to zero before moving on.
+(`--kind implementation`), looping each to zero before moving on.
 
 **Keep reasoning high.** The default `gpt-5.6-sol` at `xhigh` effort is slow (tens of minutes a
 round) on purpose: the extra reasoning is what makes the reviewer range across more areas and press
@@ -105,12 +105,12 @@ harder on edge cases. Lower `--effort` only for a deliberately quick, lighter pa
 - `0` review completed; findings written
 - `1` the Codex call failed (error on stderr; an auth error names `codex login`)
 - `2` bad arguments (e.g. the topic is not a valid kebab slug)
-- `3` no thread exists for this topic — start with a non-`fix-round` kind
+- `3` no thread exists for this topic; start with a non-`fix-round` kind
 
 ## Environment variables
 
-- `CODEX_BIN` — path to the `codex` binary (default `codex`)
-- `CODEX_REVIEW_MODEL` / `CODEX_REVIEW_EFFORT` — model / effort fallback (below a CLI flag)
-- `CODEX_REVIEW_OUT_DIR` — findings directory (below `--out-dir`)
-- `CODEX_REVIEW_STATE_DIR` — where thread state lives (default `~/.config/codex-review/state`)
-- `CODEX_REVIEW_TIMEOUT` — per-round timeout in seconds (default 3600)
+- `CODEX_BIN`: path to the `codex` binary (default `codex`)
+- `CODEX_REVIEW_MODEL` / `CODEX_REVIEW_EFFORT`: model / effort fallback (below a CLI flag)
+- `CODEX_REVIEW_OUT_DIR`: findings directory (below `--out-dir`)
+- `CODEX_REVIEW_STATE_DIR`: where thread state lives (default `~/.config/codex-review/state`)
+- `CODEX_REVIEW_TIMEOUT`: per-round timeout in seconds (default 3600)
