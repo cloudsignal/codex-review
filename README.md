@@ -71,6 +71,8 @@ lighter pass.
 
 ## Requirements
 
+- **Platform: macOS or Linux** (both CI-tested). Windows is not supported natively; run it under
+  WSL, which is Linux.
 - Python 3.9+ (standard library only)
 - The [OpenAI Codex CLI](https://github.com/openai/codex) on your `PATH`, authenticated once with
   `codex login`
@@ -181,13 +183,13 @@ created `0700` when the tool makes it; an existing directory you point it at is 
 (POSIX modes; on Windows this is best-effort). It makes no network calls of its own; all model access
 goes through `codex`. Review the script before installing, as you would any skill that ships code.
 
-Platform note: the process registry (`runs`/`kill`) targets POSIX (macOS/Linux); on Windows,
-liveness uses the non-destructive `OpenProcess`, but `kill`'s identity check is POSIX-only and
-declines there (stop a background run by cancelling the background job). On POSIX, `kill` ignores a
-marker past its run's deadline and, before signaling, checks via `ps` that the PID's command still
-names `run_review`/`codex`, failing closed if it can't verify. This makes signaling the wrong
-process after a crash-leftover marker + PID reuse very unlikely, but it is a heuristic, not a
-guarantee: it does not compare process creation identity.
+Platform note: macOS and Linux are supported and CI-tested. Windows is not a supported target; run
+it under WSL. If run on native Windows the wrapper degrades safely (non-destructive `OpenProcess`
+liveness, and `kill`'s identity check declines rather than risk the wrong process), but that path is
+untested. On POSIX, `kill` ignores a marker past its run's deadline and, before signaling, checks via
+`ps` that the PID's command still names `run_review`/`codex`, failing closed if it can't verify. This
+makes signaling the wrong process after a crash-leftover marker plus PID reuse very unlikely, but it
+is a heuristic, not a guarantee: it does not compare process creation identity.
 
 ## Development
 

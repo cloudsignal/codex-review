@@ -13,6 +13,7 @@ and its thread state, and sends the code under review to Codex.
 
 ## Requirements
 
+- macOS or Linux (Windows via WSL)
 - Python 3.9+ (standard library only)
 - The `codex` CLI on `PATH`, authenticated once with `codex login`
 
