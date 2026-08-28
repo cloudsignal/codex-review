@@ -78,13 +78,27 @@ prunes dead entries; `kill` stops the codex child (ending the spend) then the wr
 to a backgrounded run also tears the codex child down, so cancelling the background task stops the
 spend.
 
-## The fix loop
+## The fix loop (iterate to zero)
+
+Codex is a **second, independent reviewer** — one that did not write the code — so it is good at
+catching oversights and reasoning about correctness the author's own pass misses. Get the value by
+looping to zero findings, not by taking one round as the verdict:
 
 1. Run a first round (`--kind implementation --topic my-feature`).
-2. Read the findings, apply the ones you agree with (push back where the reviewer is wrong).
+2. Read the findings, apply the ones you agree with, and **push back with technical reasoning where
+   the reviewer is wrong** — a real fix or a justified rebuttal, never a silent skip.
 3. Run `--kind fix-round --topic my-feature --ask "fixed 1,3,4; pushed back on 2 because…"`. The
-   reviewer re-checks each earlier finding against the current tree.
-4. Repeat until clean.
+   reviewer re-checks each earlier finding against the current tree and surfaces anything new.
+4. Repeat until a round returns nothing. In practice a topic converges in **roughly 6 rounds**;
+   each round is cheaper as findings shrink.
+
+Under spec-driven development, review each stage on its own topic as it is ready: the **plan**
+(`--kind plan`), then the **design** (`--kind design`), then the **implementation**
+(`--kind implementation`) — looping each to zero before moving on.
+
+**Keep reasoning high.** The default `gpt-5.6-sol` at `xhigh` effort is slow (tens of minutes a
+round) on purpose: the extra reasoning is what makes the reviewer range across more areas and press
+harder on edge cases. Lower `--effort` only for a deliberately quick, lighter pass.
 
 ## Exit codes
 

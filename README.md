@@ -16,6 +16,36 @@ commands that write to your tree.
 - **Spend-aware.** A one-line token-usage summary on every run, a `limits` check for your plan usage
   (no tokens, no network), and `runs`/`kill` so a long background review is never a runaway.
 
+## Why an external Codex review?
+
+The point is a **second, independent reviewer** — one that didn't write the code. Reviewing your own
+work, or having the same model that wrote the code review it, inherits the author's blind spots. A
+separate Codex pass is an objective check, and Codex is particularly strong at catching **oversights**
+and at **reasoning** about correctness and edge cases.
+
+## Recommended workflow
+
+Best used inside an agent (e.g. Claude Code) as part of spec-driven development: review each stage on
+its own thread, and **loop each to zero findings** rather than taking a single round as the verdict.
+
+1. Review the **plan** (`--kind plan`) → fix → re-review until clean.
+2. Review the **design** (`--kind design`) → same loop.
+3. Review the **implementation** (`--kind implementation`) → same loop.
+
+Each round is one turn of a converging loop — in practice **~6 rounds** to reach zero:
+
+> Codex reports findings → the agent applies fixes (and pushes back, with reasoning, where the
+> reviewer is wrong) → `--kind fix-round` re-verifies every prior finding against the new tree →
+> repeat until a round returns nothing.
+
+Keep the same `--topic` across the loop so the thread remembers earlier findings and checks whether
+each is resolved.
+
+**Keep reasoning high.** The default `gpt-5.6-sol` at `xhigh` is slow — tens of minutes a round — on
+purpose: the extra reasoning is what drives the reviewer to range across more areas and press harder
+on edge cases, which is the whole value. Lower `--effort` only when you deliberately want a quick,
+lighter pass.
+
 ## Requirements
 
 - Python 3.9+ (standard library only)
