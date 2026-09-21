@@ -76,6 +76,9 @@ lighter pass.
 - Python 3.9+ (standard library only)
 - The [OpenAI Codex CLI](https://github.com/openai/codex) on your `PATH`, authenticated once with
   `codex login`
+- Last validated end to end with codex-cli 0.153.3 (`VALIDATED_CODEX_CLI` in the script). Newer
+  releases usually work; every failure message reports the version in use so a CLI change is
+  visible at once.
 
 ## Install
 
@@ -162,14 +165,14 @@ on remaining headroom). `runs`/`kill` make a backgrounded review trackable and s
 | `CODEX_REVIEW_MODEL` / `CODEX_REVIEW_EFFORT` | Model / effort fallback (below a CLI flag) |
 | `CODEX_REVIEW_OUT_DIR` | Findings directory (below `--out-dir`) |
 | `CODEX_REVIEW_STATE_DIR` | Where thread state lives |
-| `CODEX_REVIEW_TIMEOUT` | Per-round timeout in seconds (default 3600) |
+| `CODEX_REVIEW_TIMEOUT` | Per-round timeout in seconds (default 3600). The timeout message says whether codex was still working (raise this, or lower `--effort`), produced no output at all (a startup or input problem; a longer timeout will not help), or wrote something other than its `--json` events (check the CLI version named at the end of the message) |
 
 ## Exit codes
 
 | Code | Meaning |
 |------|---------|
 | `0` | Review completed; findings written |
-| `1` | Codex call failed (an auth error names `codex login`) |
+| `1` | Codex call failed (an auth error names `codex login`; every failure names the codex-cli version in use and whether it is the validated one) |
 | `2` | Bad arguments (e.g. the topic isn't a valid kebab slug) |
 | `3` | No thread exists for this topic; start with a non-`fix-round` kind |
 

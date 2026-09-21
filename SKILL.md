@@ -104,7 +104,7 @@ harder on edge cases. Lower `--effort` only for a deliberately quick, lighter pa
 ## Exit codes
 
 - `0` review completed; findings written
-- `1` the Codex call failed (error on stderr; an auth error names `codex login`)
+- `1` the Codex call failed (error on stderr; an auth error names `codex login`). Every failure message ends with the codex-cli version in use and whether it is the one this tool was last validated with (`VALIDATED_CODEX_CLI` in `run_review.py`); after a CLI upgrade, a mismatch there is the first suspect.
 - `2` bad arguments (e.g. the topic is not a valid kebab slug)
 - `3` no thread exists for this topic; start with a non-`fix-round` kind
 
@@ -114,4 +114,4 @@ harder on edge cases. Lower `--effort` only for a deliberately quick, lighter pa
 - `CODEX_REVIEW_MODEL` / `CODEX_REVIEW_EFFORT`: model / effort fallback (below a CLI flag)
 - `CODEX_REVIEW_OUT_DIR`: findings directory (below `--out-dir`)
 - `CODEX_REVIEW_STATE_DIR`: where thread state lives (default `~/.config/codex-review/state`)
-- `CODEX_REVIEW_TIMEOUT`: per-round timeout in seconds (default 3600)
+- `CODEX_REVIEW_TIMEOUT`: per-round timeout in seconds (default 3600). A timeout message says which of three things happened: `codex produced no output at all` means codex never started (a startup or input problem; raising the timeout or lowering the effort will not help, fix the cause and re-run), `codex was still working` means the review is genuinely long (raise `CODEX_REVIEW_TIMEOUT` or lower `--effort`), and `not --json events` means codex wrote something other than its event stream (check the CLI version line that ends the message; a longer timeout will not help).

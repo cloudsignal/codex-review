@@ -12,13 +12,64 @@ from pathlib import Path
 
 RUNNER = Path(__file__).resolve().parent.parent / "scripts" / "run_review.py"
 
+
+def _runner_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("run_review_under_test", RUNNER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 STUB = """#!/bin/bash
 # Stub codex. Records argv, emits the JSONL events codex exec --json emits,
 # and writes the file named by -o.
 #   STUB_MODE=fail     exits 2 with no output file
 #   STUB_MODE=auth     exits 1 with an authentication error on stderr
 #   STUB_MODE=nothread succeeds but emits no thread.started event
+#   STUB_MODE=hang     blocks before its first event (e.g. waiting on stdin): no stdout at all
+#   STUB_MODE=slow     a genuinely long review: events flow, then it stalls mid-turn
+#   STUB_MODE=garbage  writes a non-JSON line, then stalls
+#   STUB_MODE=orphan   emits thread.started, leaves a descendant holding stdout, then stalls
+#   STUB_MODE=empty    completes but writes an empty review file
+#   STUB_MODE=stdin    reads inherited stdin to EOF before its first event, as codex-cli
+#                      0.153.3 does; blocks for ever on a pipe nobody closes
+# `--version` answers like the real CLI and is recorded separately (never in STUB_LOG).
+if [ "${1:-}" = "--version" ]; then
+  printf '%s\\n' "$@" >> "$STUB_LOG.version"
+  if [ -n "${STUB_VERSION_FAIL:-}" ]; then exit 1; fi
+  if [ -n "${STUB_VERSION_BYTES:-}" ]; then printf 'codex-cli \\xff0.0.0\\n'; exit 0; fi
+  echo "${STUB_VERSION:-codex-cli 0.0.0-stub}"
+  exit 0
+fi
 printf '%s\\n' "$@" >> "$STUB_LOG"
+if [ "${STUB_MODE:-ok}" = "hang" ]; then
+  echo 'Reading additional input from stdin...' >&2
+  echo $$ > "$STUB_LOG.pid"
+  exec sleep 30
+fi
+if [ "${STUB_MODE:-ok}" = "slow" ]; then
+  echo '{"type":"thread.started","thread_id":"stub-thread-1"}'
+  echo '{"type":"turn.started"}'
+  echo '{"type":"item.started","item":{"type":"command_execution"}}'
+  echo $$ > "$STUB_LOG.pid"
+  exec sleep 30
+fi
+if [ "${STUB_MODE:-ok}" = "garbage" ]; then
+  echo 'not a json event'
+  echo $$ > "$STUB_LOG.pid"
+  exec sleep 30
+fi
+if [ "${STUB_MODE:-ok}" = "orphan" ]; then
+  echo '{"type":"thread.started","thread_id":"stub-thread-1"}'
+  sleep 30 &
+  echo $! > "$STUB_LOG.orphan"
+  echo $$ > "$STUB_LOG.pid"
+  exec sleep 30
+fi
+if [ "${STUB_MODE:-ok}" = "stdin" ]; then
+  echo 'Reading additional input from stdin...' >&2
+  cat > "$STUB_LOG.stdin"
+fi
 if [ "${STUB_MODE:-ok}" = "fail" ]; then
   echo "stub: simulated failure" >&2
   exit 2
@@ -40,6 +91,12 @@ for a in "$@"; do
   if [ "$prev" = "-o" ]; then out="$a"; fi
   prev="$a"
 done
+if [ "${STUB_MODE:-ok}" = "empty" ]; then
+  echo '{"type":"thread.started","thread_id":"stub-thread-1"}'
+  echo '{"type":"turn.completed"}'
+  : > "$out"
+  exit 0
+fi
 if [ "${STUB_MODE:-ok}" != "nothread" ]; then
   echo '{"type":"thread.started","thread_id":"stub-thread-1"}'
 fi
@@ -77,7 +134,7 @@ class RunReviewTest(unittest.TestCase):
         self.stub_log = self.tmp / "stub.log"
         self.stub_log.write_text("")
 
-    def run_review(self, *extra, env_extra=None, topic="thing"):
+    def run_review(self, *extra, env_extra=None, topic="thing", stdin=None):
         env = dict(os.environ)
         env.update({
             "CODEX_BIN": str(self.stub),
@@ -88,8 +145,29 @@ class RunReviewTest(unittest.TestCase):
         return subprocess.run(
             [sys.executable, str(RUNNER), "--cwd", str(self.repo),
              "--topic", topic, "--doc", "docs/thing.md", *extra],
-            capture_output=True, text=True, env=env,
+            capture_output=True, text=True, env=env, stdin=stdin,
         )
+
+    def version_calls(self):
+        log = Path(str(self.stub_log) + ".version")
+        return log.read_text() if log.exists() else ""
+
+    def stub_pid_alive(self):
+        pid = int(Path(str(self.stub_log) + ".pid").read_text())
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def run_markers(self):
+        # The marker directory itself: `runs` prunes dead markers, so asking it would pass
+        # even if the timeout path had forgotten the marker.
+        return sorted((self.state_dir / "runs").glob("*.json"))
+
+    def assert_ends_with_version_note(self, text, prefix="codex-cli 0.0.0-stub"):
+        # The contract: the version note is the LAST line of every failure message.
+        self.assertTrue(text.rstrip().splitlines()[-1].startswith(prefix), text)
 
     def state_files(self):
         return sorted(self.state_dir.glob("*.json"))
@@ -237,6 +315,7 @@ class RunReviewTest(unittest.TestCase):
         r = self.run_review("--kind", "plan", env_extra={"STUB_MODE": "nothread"})
         self.assertEqual(r.returncode, 1)
         self.assertIn("no thread.started", r.stderr)
+        self.assertIn("codex-cli 0.0.0-stub", r.stderr)  # an event-schema change lands here
         # The paid review text is surfaced rather than silently discarded.
         self.assertIn("STUB REVIEW FINDINGS", r.stderr)
         self.assertEqual(self.state_files(), [])
@@ -296,7 +375,131 @@ class RunReviewTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertNotIn("Traceback", r.stderr)
         self.assertIn("could not run the codex binary", r.stderr)
+        self.assert_ends_with_version_note(r.stderr, "codex CLI version: unknown")
         self.assertEqual(self.state_files(), [])
+
+    def test_codex_stdin_is_closed_so_an_inherited_open_pipe_cannot_block_it(self):
+        # codex-cli 0.153.3 reads a non-terminal stdin to EOF before its first turn and
+        # appends it to the prompt. An agent's background task hands this wrapper a pipe
+        # that is never closed, so a codex that inherits it blocks until the timeout with
+        # no output, and the round is reported as "timed out" instead of "never started".
+        # The wrapper must therefore give codex a closed stdin, whatever it inherited.
+        read_end, write_end = os.pipe()
+        self.addCleanup(os.close, write_end)  # held open for the whole run, like the harness
+        try:
+            r = self.run_review("--kind", "plan", stdin=read_end, env_extra={
+                "STUB_MODE": "stdin", "CODEX_REVIEW_TIMEOUT": "5"})
+        finally:
+            os.close(read_end)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("STUB REVIEW FINDINGS", self.expected_findings().read_text())
+        self.assertEqual(self.version_calls(), "")  # a clean round never asks for the version
+        # Closed, not fed: a stdin=PIPE that was written to and closed would also not hang,
+        # but real codex would append those bytes to the prompt.
+        self.assertEqual(Path(str(self.stub_log) + ".stdin").read_bytes(), b"")
+
+    def test_timeout_with_no_output_names_a_startup_problem(self):
+        # A working review emits JSON events within seconds; a child that produced nothing
+        # by the deadline was blocked at startup (stdin, auth prompt, sandbox), not slow.
+        # The message must say so, or the next move is to raise the timeout and wait again.
+        r = self.run_review("--kind", "plan", env_extra={
+            "STUB_MODE": "hang", "CODEX_REVIEW_TIMEOUT": "2"})
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("timed out after 2s", r.stderr)
+        self.assertIn("no output at all", r.stderr)
+        self.assertIn("not a slow review", r.stderr)
+        self.assertIn("Reading additional input from stdin", r.stderr)  # child stderr surfaced
+        self.assert_ends_with_version_note(r.stderr)
+        self.assertNotIn("still working", r.stderr)
+        self.assertEqual(self.state_files(), [])
+        # The child was reaped and its run marker removed, not abandoned behind the message.
+        self.assertFalse(self.stub_pid_alive())
+        self.assertEqual(self.run_markers(), [])
+
+    def test_timeout_mid_review_reports_the_progress_made(self):
+        r = self.run_review("--kind", "plan", env_extra={
+            "STUB_MODE": "slow", "CODEX_REVIEW_TIMEOUT": "2"})
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("timed out after 2s", r.stderr)
+        self.assertIn("still working", r.stderr)
+        self.assertIn("3 events", r.stderr)
+        self.assertIn("item.started", r.stderr)
+        self.assertIn("CODEX_REVIEW_TIMEOUT", r.stderr)
+        self.assertNotIn("no output at all", r.stderr)
+        self.assert_ends_with_version_note(r.stderr)
+        self.assertFalse(self.stub_pid_alive())
+        self.assertEqual(self.state_files(), [])
+
+    def test_timeout_keeps_partial_output_when_a_descendant_holds_the_pipes(self):
+        # After the direct child is killed a grandchild can keep stdout/stderr open, so the
+        # retried communicate() times out too. The evidence read so far must still be used.
+        r = self.run_review("--kind", "plan", env_extra={
+            "STUB_MODE": "orphan", "CODEX_REVIEW_TIMEOUT": "2"})
+        orphan = int(Path(str(self.stub_log) + ".orphan").read_text())
+
+        def kill_orphan():
+            try:
+                os.kill(orphan, 9)
+            except ProcessLookupError:
+                pass
+        self.addCleanup(kill_orphan)  # the fixture's descendant must not outlive the test
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("timed out after 2s", r.stderr)
+        self.assertIn("still working", r.stderr)
+        self.assertIn("1 event received", r.stderr)
+        self.assertIn("thread.started", r.stderr)
+        self.assert_ends_with_version_note(r.stderr)
+        self.assertFalse(self.stub_pid_alive())
+        self.assertEqual(self.run_markers(), [])
+        self.assertEqual(self.state_files(), [])
+
+    def test_timeout_with_non_json_output_is_reported_as_such(self):
+        r = self.run_review("--kind", "plan", env_extra={
+            "STUB_MODE": "garbage", "CODEX_REVIEW_TIMEOUT": "2"})
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("timed out after 2s", r.stderr)
+        self.assertIn("not --json events", r.stderr)
+        self.assertIn("not a json event", r.stderr)
+        self.assertNotIn("still working", r.stderr)
+        self.assertNotIn("no output at all", r.stderr)
+        self.assert_ends_with_version_note(r.stderr)
+        self.assertFalse(self.stub_pid_alive())
+        self.assertEqual(self.state_files(), [])
+
+    def test_failure_messages_name_the_codex_cli_version(self):
+        # A break that comes from a CLI change (0.153.3's stdin read was one) is invisible
+        # unless the failure names the CLI version and whether it is the one validated.
+        validated = _runner_module().VALIDATED_CODEX_CLI
+        r = self.run_review("--kind", "plan", env_extra={"STUB_MODE": "fail"})
+        self.assertEqual(r.returncode, 1)
+        self.assert_ends_with_version_note(r.stderr)
+        self.assertIn(f"last validated with codex-cli {validated}", r.stderr)
+        self.assertIn("likely cause", r.stderr)
+        self.assertEqual(self.version_calls().strip(), "--version")
+        # An empty review is a failure too, and ends the same way.
+        r = self.run_review("--kind", "plan", env_extra={"STUB_MODE": "empty"})
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("empty review", r.stderr)
+        self.assert_ends_with_version_note(r.stderr)
+        # A --version reply that is not UTF-8 must not replace the failure with a traceback.
+        r = self.run_review("--kind", "plan", env_extra={
+            "STUB_MODE": "fail", "STUB_VERSION_BYTES": "1"})
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("codex exited 2", r.stderr)
+        self.assert_ends_with_version_note(r.stderr, "codex-cli \ufffd0.0.0")
+        r = self.run_review("--kind", "plan", env_extra={
+            "STUB_MODE": "fail", "STUB_VERSION": f"codex-cli {validated}"})
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(f"codex-cli {validated}", r.stderr)
+        self.assertNotIn("likely cause", r.stderr)
+        # --version failing must not mask the real failure.
+        r = self.run_review("--kind", "plan", env_extra={
+            "STUB_MODE": "fail", "STUB_VERSION_FAIL": "1"})
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("stub: simulated failure", r.stderr)
+        self.assertIn("codex exited 2", r.stderr)
+        self.assert_ends_with_version_note(r.stderr, "codex CLI version: unknown")
 
     def test_malformed_state_is_refused_and_never_blocks_other_topics(self):
         self.state_dir.mkdir(parents=True)

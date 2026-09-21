@@ -444,6 +444,106 @@ def findings_path(cwd, topic, out_dir=DEFAULT_OUT_DIR):
     return reviews / f"{date.today().isoformat()}-{topic}-codex-review.md"
 
 
+# The codex-cli version this tool was last exercised against end to end. The model is
+# pinned above; the CLI is whatever is installed, and a CLI change is the usual cause of a
+# break no flag explains (0.153.3 began reading a non-terminal stdin before its first turn).
+# Every failure message names the running version and whether it is this one.
+VALIDATED_CODEX_CLI = "0.153.3"
+
+
+def codex_cli_version(codex_bin):
+    """`codex --version` as the CLI prints it (``codex-cli 0.153.3``), or None."""
+    try:
+        cp = subprocess.run([codex_bin, "--version"], stdin=subprocess.DEVNULL,
+                            capture_output=True, encoding="utf-8", errors="replace",
+                            timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    lines = (cp.stdout or "").strip().splitlines()
+    if cp.returncode != 0 or not lines:
+        return None
+    return lines[0].strip()
+
+
+def _version_note(codex_bin):
+    """One line for failure messages: the CLI in use and whether it is the validated one."""
+    version = codex_cli_version(codex_bin)
+    if version is None:
+        return (f"codex CLI version: unknown (`{codex_bin} --version` failed); this tool was "
+                f"last validated with codex-cli {VALIDATED_CODEX_CLI}")
+    if version.split()[-1] == VALIDATED_CODEX_CLI:
+        return f"{version} (the version this tool was last validated with)"
+    return (f"{version}; this tool was last validated with codex-cli {VALIDATED_CODEX_CLI}, "
+            "so a CLI behaviour change is a likely cause")
+
+
+def _parse_events(out):
+    """The JSON events codex --json wrote to stdout: (events, thread_id, stream_errors)."""
+    events, thread_id, stream_errors = [], None, []
+    for line in out.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        events.append(event)
+        etype = event.get("type")
+        if etype == "thread.started":
+            thread_id = event.get("thread_id")
+        elif etype == "error":
+            msg = event.get("message")
+            if msg:
+                stream_errors.append(str(msg))
+        elif etype == "turn.failed":
+            err = event.get("error")
+            msg = err.get("message") if isinstance(err, dict) else None
+            stream_errors.append(str(msg) if msg else "turn failed")
+    return events, thread_id, stream_errors
+
+
+def _partial_text(data):
+    """Partial stream output off a TimeoutExpired: bytes even in text mode, or None."""
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return data
+
+
+def _timeout_message(timeout, out, stderr_text, codex_bin):
+    """Say what the timeout means. "Timed out" alone reads as "slow review", and the fix
+    for a slow review (a longer timeout, a lower effort) is exactly wrong for a child that
+    never started: a working review emits JSON events within seconds, so no output at all
+    by the deadline is a startup or input problem, not a long one. Like every failure
+    message, it ends with the codex-cli version note."""
+    out, stderr_text = out or "", stderr_text or ""
+    lines = [f"codex timed out after {timeout}s; no state was changed"]
+    if not out.strip():
+        lines.append(
+            "codex produced no output at all in that time. A working review emits JSON "
+            "events within seconds, so this is a startup or input problem (codex waiting "
+            "on stdin or a prompt, or failing to set up its sandbox), not a slow review: "
+            "raising CODEX_REVIEW_TIMEOUT would only wait longer for the same hang.")
+    else:
+        events, _thread_id, _errors = _parse_events(out)
+        if events:
+            count = f"{len(events)} event{'s' if len(events) != 1 else ''} received"
+            lines.append(
+                f"codex was still working: {count}, the last of type "
+                f"{events[-1].get('type')!r}. The review is genuinely longer than this "
+                f"timeout; raise CODEX_REVIEW_TIMEOUT (now {timeout}) or lower --effort.")
+        else:
+            lines.append(
+                f"codex wrote {len(out)} characters that are not --json events before the "
+                "deadline, so it never reached a turn; the output starts: "
+                f"{out.strip()[:200]!r}")
+    if stderr_text.strip():
+        lines.append("codex stderr:\n" + stderr_text.rstrip())
+    lines.append(_version_note(codex_bin))  # the last line of every failure, by contract
+    return "\n".join(lines)
+
+
 def run_codex(cmd_prefix, prompt, cwd, timeout, model, effort, topic=None):
     with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as f:
         out_file = f.name
@@ -459,14 +559,22 @@ def run_codex(cmd_prefix, prompt, cwd, timeout, model, effort, topic=None):
     # be stopped by `kill` or by a stop signal to this wrapper (see _install_run_cleanup).
     # codex stays in this process's group, so a foreground timeout that group-kills the
     # wrapper still takes codex with it (no orphan).
+    # stdin=DEVNULL is load-bearing, not hygiene: codex-cli 0.153.3 reads a non-terminal
+    # stdin to EOF before its first turn and appends it to the prompt ("Reading additional
+    # input from stdin..."). Inherited from an agent's background task, that stdin is a pipe
+    # nobody closes, so codex blocked with no output until the timeout below and the round
+    # read as "timed out" rather than "never started". A closed stdin ends the whole class:
+    # no present or future codex flag can wait on input the child does not have.
     try:
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=str(cwd)
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, cwd=str(cwd)
         )
     except (FileNotFoundError, PermissionError) as exc:
         os.unlink(out_file)
         sys.exit(f"could not run the codex binary {cmd[0]!r} ({exc.strerror}); "
-                 "install the Codex CLI or set CODEX_BIN; no state was changed")
+                 "install the Codex CLI or set CODEX_BIN; no state was changed\n"
+                 + _version_note(cmd[0]))
     now = time.time()
     marker = _write_run_marker({
         "mode": "inspect", "pid": os.getpid(), "codex_pid": proc.pid,
@@ -479,35 +587,26 @@ def run_codex(cmd_prefix, prompt, cwd, timeout, model, effort, topic=None):
     except subprocess.TimeoutExpired:
         _terminate_pid(proc.pid)
         try:
-            proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
+            # Retrying communicate() after a timeout keeps everything read so far, which is
+            # the evidence the message below is built from.
+            out, stderr_text = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired as still_open:
+            # A descendant of codex still holds the pipes after the child itself was
+            # stopped. The exception carries everything read so far; use that.
+            out = _partial_text(still_open.output)
+            stderr_text = _partial_text(still_open.stderr)
+            try:
+                # Reap the stopped child itself; the pipes it left behind can stay open.
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         os.unlink(out_file)
-        sys.exit(f"codex timed out after {timeout}s; no state was changed")
+        sys.exit(_timeout_message(timeout, out, stderr_text, cmd[0]))
     finally:
         _TRACKED_CHILD_PIDS.discard(proc.pid)
         _remove_run_marker(marker)
     returncode = proc.returncode
-    thread_id = None
-    stream_errors = []
-    events = []
-    for line in out.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        events.append(event)
-        etype = event.get("type")
-        if etype == "thread.started":
-            thread_id = event.get("thread_id")
-        elif etype == "error":
-            msg = event.get("message")
-            if msg:
-                stream_errors.append(str(msg))
-        elif etype == "turn.failed":
-            err = event.get("error")
-            msg = err.get("message") if isinstance(err, dict) else None
-            stream_errors.append(str(msg) if msg else "turn failed")
+    events, thread_id, stream_errors = _parse_events(out)
     if returncode != 0:
         sys.stderr.write(stderr_text)
         os.unlink(out_file)
@@ -521,11 +620,12 @@ def run_codex(cmd_prefix, prompt, cwd, timeout, model, effort, topic=None):
         if any(marker in haystack for marker in AUTH_MARKERS):
             message += ("\ncodex authentication looks expired or revoked: "
                         "run `codex login` and retry this round")
-        sys.exit(message)
+        sys.exit(message + "\n" + _version_note(cmd[0]))
     review = Path(out_file).read_text()
     os.unlink(out_file)
     if not review.strip():
-        sys.exit("codex returned an empty review; no state was changed")
+        sys.exit("codex returned an empty review; no state was changed\n"
+                 + _version_note(cmd[0]))
     return thread_id, review, extract_usage(events)
 
 
@@ -908,7 +1008,8 @@ def main():
     if state is None and not usable(thread_id):
         sys.stderr.write(review)
         sys.exit("codex emitted no thread.started event, so this review cannot be resumed; "
-                 "the review text above was printed rather than saved, and no state was changed")
+                 "the review text above was printed rather than saved, and no state was changed"
+                 "\n" + _version_note(codex))
 
     now = time.time()
     if state is None:
