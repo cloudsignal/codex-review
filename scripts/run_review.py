@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Run one round of an external Codex code review.
+"""External Codex code reviews, prompt evals, and web research.
 
 Drives `codex exec` / `codex exec resume` in a read-only sandbox, keeps one Codex thread
-per review topic (so fix-rounds re-verify earlier findings against the current tree), and
-appends each round's findings to a Markdown file. Standard library only.
+per topic (so fix-rounds re-verify earlier findings against the current tree), and appends
+each round to a Markdown file. Standard library only.
 
-Subcommands: `limits` (subscription usage, no spend), `runs` (in-flight reviews),
-`kill <pid|topic>` (stop one).
+Subcommands: `research` (answer a question with web search), `eval-advise` and
+`eval-compare` (critique a prompt, or run it and judge it blind against an existing result),
+`advise` (preview model selection, no spend), `limits` (subscription usage, no spend),
+`runs` (in-flight runs), `kill <pid|topic>` (stop one).
 """
 import argparse
 import atexit
 import hashlib
 import json
 import os
+import random
 import re
+import secrets
 import signal
 import stat
 import subprocess
@@ -23,17 +27,25 @@ import time
 from datetime import date
 from pathlib import Path
 
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    # The installed skill ships selection.py next to this file. Tests load this file by
+    # path, which puts nothing on sys.path.
+    sys.path.insert(0, str(_HERE))
+import selection  # noqa: E402
+
 KINDS = ("plan", "design", "implementation", "fix-round")
 PRUNE_DAYS = 30
 
-# The DEFAULT reviewer + effort. Heavier reasoning gives a better review, so this is the
-# documented default; both are selectable per run (--model/--effort, or the
-# CODEX_REVIEW_MODEL / CODEX_REVIEW_EFFORT env fallback). Precedence: CLI > env > default.
-DEFAULT_MODEL = "gpt-5.6-sol"
-DEFAULT_EFFORT = "xhigh"
-# The reasoning-effort values codex accepts; validated before the (paid) call so a typo
-# fails fast rather than burning a round.
-EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+# A review's reviewer + effort. Reviews stay pinned to these unless a flag, the
+# CODEX_REVIEW_MODEL/CODEX_REVIEW_EFFORT env vars, or --model auto says otherwise.
+# Precedence: CLI > env > default. Every other action selects automatically (selection.py).
+DEFAULT_MODEL = selection.REVIEW_MODEL
+DEFAULT_EFFORT = selection.REVIEW_EFFORT
+# The effort list used when the live model catalog cannot be read.
+EFFORTS = selection.STATIC_EFFORTS
+# `codex debug models` spends no tokens; bound it so a hung CLI cannot stall a run.
+CATALOG_TIMEOUT = 30
 
 # Where a review's findings file is written, relative to --cwd (override with --out-dir or
 # the CODEX_REVIEW_OUT_DIR env var).
@@ -41,14 +53,82 @@ DEFAULT_OUT_DIR = ".codex-review/reviews"
 
 
 def resolve_model_effort(cli_model, cli_effort):
-    """CLI > env > default, with effort validated against EFFORTS. Exits on a bad value."""
+    """A review's model and effort: CLI > env > default. Validation is separate
+    (validate_choice, against the live model catalog)."""
     model = (cli_model or env("CODEX_REVIEW_MODEL", "") or DEFAULT_MODEL).strip()
     effort = (cli_effort or env("CODEX_REVIEW_EFFORT", "") or DEFAULT_EFFORT).strip()
     if not model:
-        sys.exit("--model must not be blank")
-    if effort not in EFFORTS:
-        sys.exit("invalid effort %r; choose one of: %s" % (effort, ", ".join(EFFORTS)))
+        _bad_args("--model must not be blank")
     return model, effort
+
+
+def _bad_args(message):
+    """Exit 2, the bad-arguments code, with the reason on stderr. Callers use it only before
+    any paid codex call, so nothing was spent."""
+    print(message, file=sys.stderr)
+    raise SystemExit(2)
+
+
+def load_catalog(codex_bin):
+    """The live model catalog from `codex debug models` (no tokens spent), or an unavailable
+    selection.Catalog when it cannot be read: an older CLI, a failure, or a timeout."""
+    try:
+        proc = subprocess.run([codex_bin, "debug", "models"], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=CATALOG_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        proc = None
+    models = (selection.parse_catalog(proc.stdout)
+              if proc is not None and proc.returncode == 0 else None)
+    if models is None:
+        print("codex model catalog unavailable (`codex debug models` failed); efforts are "
+              "checked against the static list only", file=sys.stderr)
+    return selection.Catalog(models)
+
+
+def validate_choice(model, effort, catalog):
+    """Exit 2 unless codex accepts this model at this effort."""
+    try:
+        selection.validate(model, effort, catalog)
+    except selection.SelectionError as exc:
+        _bad_args(str(exc))
+
+
+def current_headroom():
+    """selection.effective_headroom over codex's last persisted rate-limit snapshot, read off
+    disk: no spend, no network."""
+    rate_limits, _ts = latest_rate_limits(_codex_home())
+    return selection.effective_headroom(rate_limits, time.time())
+
+
+def warn_if_near_limit(model, effort):
+    """A pinned review never steps down near a limit; it says so instead."""
+    headroom = current_headroom()
+    if headroom is not None:
+        print(f"warning: codex usage is near its limit "
+              f"({selection.describe_headroom(headroom, time.time())}); this review still "
+              f"runs at {model} / {effort}. Pass --effort high for a lighter round.",
+              file=sys.stderr)
+
+
+def repo_identity(cwd):
+    """(origin, branch) keying thread state. Exit 2 when cwd is not a git worktree; a .git
+    directory answers `rev-parse --abbrev-ref HEAD` but is not inside a work tree."""
+    try:
+        inside = git(cwd, "rev-parse", "--is-inside-work-tree")
+    except (subprocess.CalledProcessError, OSError):
+        inside = "false"
+    if inside != "true":
+        _bad_args(f"{cwd} is not a git worktree; pass --cwd <worktree>")
+    try:
+        branch = git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
+    except subprocess.CalledProcessError:
+        # A fresh `git init` has no HEAD commit yet, so it has no branch to key threads by.
+        _bad_args(f"{cwd} has no commits yet; commit once first (threads are keyed by branch)")
+    try:
+        origin = sanitize_origin(git(cwd, "remote", "get-url", "origin"))
+    except subprocess.CalledProcessError:
+        origin = str(cwd)
+    return origin, branch
 
 
 # --------------------------------------------------------------------------
@@ -149,15 +229,12 @@ def format_usage_detail(usage, as_json=False):
 
 
 def _print_usage(usage, detail_mode):
-    """Print the always-on one-line usage summary, plus a breakdown if --usage was given.
-
-    Printed to stdout BEFORE the findings-path line so the final stdout line stays the
-    findings path (the skill/agent reads that last line). Never raises: usage reporting
-    must not change a review's outcome.
-    """
-    print(format_usage(usage))
+    """Print the optional --usage breakdown, then the always-on one-line summary. The output
+    path prints last, so the summary always sits directly above it. Never raises: usage
+    reporting must not change a run's outcome."""
     if detail_mode:
         print(format_usage_detail(usage, as_json=(detail_mode == "json")))
+    print(format_usage(usage))
 
 # Matched with fullmatch: `$` alone would accept a trailing newline and put it in a filename.
 TOPIC_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -348,9 +425,26 @@ def sanitize_origin(url):
     return (m.group(1) + m.group(3)) if m else url
 
 
-def state_path(origin, branch, topic):
+# Per action: the state-file prefix (None keeps the review name unchanged), the default
+# output directory relative to --cwd (a run's --out-dir overrides it), the file suffix, and
+# the file title.
+ACTIONS = {
+    "review": {"state": None, "dir": DEFAULT_OUT_DIR, "suffix": "codex-review",
+               "title": "Codex review"},
+    "research": {"state": "research", "dir": ".codex-review/research",
+                 "suffix": "codex-research", "title": "Codex research"},
+    "eval": {"state": "eval", "dir": ".codex-review/evals", "suffix": "codex-eval",
+             "title": "Codex eval"},
+}
+
+
+def state_path(origin, branch, topic, action="review"):
     key = hashlib.sha256(f"{origin}\n{branch}".encode()).hexdigest()[:12]
-    return state_dir() / f"{key}-{topic}.json"
+    prefix = ACTIONS[action]["state"]
+    # "_" appears in neither a key (hex) nor a topic (kebab-case), so an action's state can
+    # never collide with a review's: research "foo" is not review "research-foo".
+    name = f"{key}-{topic}.json" if prefix is None else f"{key}_{prefix}-{topic}.json"
+    return state_dir() / name
 
 
 def save_state(path, state):
@@ -363,20 +457,23 @@ def save_state(path, state):
     os.replace(tmp, path)
 
 
-def load_state(path):
+REVIEW_RESTART = "start a new review with --kind plan|design|implementation"
+
+
+def load_state(path, restart=REVIEW_RESTART):
     """Read and validate one state file, or None when it does not exist.
 
     Every field the run later depends on is checked here, before any Codex call, so a
     malformed file is a clear message instead of an AttributeError or a KeyError raised
-    after a paid round has already been spent.
+    after a paid round has already been spent. `restart` tells the user how to begin a new
+    thread once they delete the file.
     """
     if not path.exists():
         return None
     try:
         state = json.loads(path.read_text())
     except (json.JSONDecodeError, OSError) as exc:
-        sys.exit(f"state file {path} could not be read ({exc}); "
-                 "delete it and start a new review with --kind plan|design|implementation")
+        sys.exit(f"state file {path} could not be read ({exc}); delete it and {restart}")
     if not isinstance(state, dict):
         problems = [f"expected a JSON object, found {type(state).__name__}"]
     else:
@@ -389,8 +486,18 @@ def load_state(path):
             problems.append("no rounds list")
     if problems:
         sys.exit(f"state file {path} is unusable ({'; '.join(problems)}); "
-                 "delete it and start a new review with --kind plan|design|implementation")
+                 f"delete it and {restart}")
     return state
+
+
+def preload_state(origin, branch, topic, action="review"):
+    """Prune expired threads, then load this topic's state. Callers run it before any paid
+    call, the router included, so a corrupt file is refused and an expired thread is dropped
+    before anything is spent, not after."""
+    prune_stale()
+    restart = (REVIEW_RESTART if action == "review"
+               else "run the same command again to start a new thread")
+    return load_state(state_path(origin, branch, topic, action), restart)
 
 
 def prune_stale():
@@ -417,14 +524,179 @@ def prune_stale():
                 continue
 
 
+# Prompt templates live in references/ and JSON output schemas in assets/, beside scripts/.
+TEMPLATES = _HERE.parent / "references"
+SCHEMAS = _HERE.parent / "assets"
+_PLACEHOLDER = re.compile(r"\{\{([A-Z_]+)\}\}")
+
+
+def render_text(template, values):
+    """Fill {{NAME}} placeholders in ONE pass. Inserted values are never scanned again, so
+    caller text containing "{{ASK}}" reaches codex verbatim; sequential str.replace calls
+    would splice later values into earlier ones."""
+    return _PLACEHOLDER.sub(lambda m: values[m.group(1)], template)
+
+
+def load_template(name):
+    return (TEMPLATES / f"{name}.md").read_text()
+
+
+def doc_list(docs):
+    return "\n".join(f"- {d}" for d in docs) or "None."
+
+
 def render(kind, topic, docs, ask):
-    template = Path(__file__).resolve().parent.parent / "references" / f"{kind}.md"
-    text = template.read_text()
-    return (
-        text.replace("{{TOPIC}}", topic)
-        .replace("{{DOCS}}", "\n".join(f"- {d}" for d in docs))
-        .replace("{{ASK}}", ask or "None.")
-    )
+    return render_text(load_template(kind),
+                       {"TOPIC": topic, "DOCS": doc_list(docs), "ASK": ask or "None."})
+
+
+ROUTER_TIMEOUT = 120
+
+
+def fence(label, text, nonce):
+    """Delimit untrusted content with a per-run nonce, so content that carries a fake end
+    marker cannot close its own block."""
+    return f"<<<BEGIN {label} {nonce}>>>\n{text}\n<<<END {label} {nonce}>>>"
+
+
+def _first_line(code):
+    text = str(code).strip() if code is not None else ""
+    return text.splitlines()[0] if text else "no detail"
+
+
+def route_tier(codex, *, action, ask, docs, cwd, research, catalog, topic, timeout,
+               prompt_under_test=None):
+    """(tier, source, usage) from one cheap ephemeral codex call. Any failure falls back to
+    standard with the reason in `source`: the router never fails a run. It waits at most
+    ROUTER_TIMEOUT, or the run's own timeout when that is shorter."""
+    if not catalog.supports(selection.ROUTER_MODEL, selection.ROUTER_EFFORT):
+        return ("standard", f"router fallback ({selection.ROUTER_MODEL} is not in the codex "
+                "catalog)", None)
+    sizes = []
+    for doc in docs:
+        try:
+            sizes.append(f"- {doc} ({(cwd / doc).stat().st_size} bytes)")
+        except OSError:
+            sizes.append(f"- {doc} (missing)")
+    task = ask.strip() or "None."
+    if prompt_under_test is not None:
+        task += (f"\n\nPrompt under test ({len(prompt_under_test.encode('utf-8'))} bytes), "
+                 f"first 2000 characters:\n{prompt_under_test[:2000]}")
+    prompt = render_text(load_template("router"), {
+        "ACTION": action,
+        "RESEARCH": "yes" if research else "no",
+        "DOCS": "\n".join(sizes) or "None.",
+        "TASK": fence("TASK", task, secrets.token_hex(4)),
+    })
+    if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+        return "standard", "router fallback (the task is too large to route)", None
+    # An empty directory: the router has nothing to explore, so it answers fast.
+    with tempfile.TemporaryDirectory() as empty:
+        try:
+            _thread, text, usage = run_codex(
+                [codex, "exec"], prompt, Path(empty), min(ROUTER_TIMEOUT, timeout),
+                selection.ROUTER_MODEL, selection.ROUTER_EFFORT, topic,
+                ephemeral=True, schema=SCHEMAS / "router.schema.json")
+        except CodexCallFailed as exc:
+            # Only a failed call falls back. A stop signal (plain SystemExit) propagates, so a
+            # cancelled run never goes on to pay for the main call.
+            return "standard", f"router fallback ({_first_line(exc.code)})", exc.usage
+    try:
+        tier, reason = selection.parse_router_output(text)
+    except selection.SelectionError as exc:
+        return "standard", f"router fallback ({exc})", usage
+    return tier, f'router: "{reason}"', usage
+
+
+def make_router(codex, **context):
+    """A route() closure that calls route_tier at most once per run, so eval compare's two
+    selections share one router call and its usage is counted once."""
+    memo = {}
+
+    def route():
+        if "result" in memo:
+            tier, source, _usage = memo["result"]
+            return tier, source, None
+        memo["result"] = route_tier(codex, **context)
+        return memo["result"]
+
+    return route
+
+
+def preflight_auto(profile, tier, catalog):
+    """Exit 2 before any paid call unless automatic selection can serve this profile: a rung
+    at or below --tier, or, when the router will choose, at or below the lowest tier it can
+    answer. Fallback never walks up past the chosen tier, so this is what keeps a paid router
+    answer from ending in exit 2."""
+    if tier:
+        check = tier
+    elif catalog.supports(selection.ROUTER_MODEL, selection.ROUTER_EFFORT):
+        check = selection.lowest_tier(profile)
+    else:
+        # route_tier answers standard without a call when the router model is missing.
+        check = "standard"
+    try:
+        selection.pick(profile, check, catalog)
+    except selection.SelectionError as exc:
+        hint = ("" if tier else "; the router may pick any tier, so pass --tier with one "
+                "whose model is available")
+        _bad_args(f"{exc}{hint}")
+
+
+def describe_source(model_from, effort_from, *, default, fallback):
+    """Where a run's model and effort came from, for its printed and recorded Model: line.
+    Each `*_from` names a flag or env var, or None when that half came from `fallback`;
+    `default` describes the case where neither half was given."""
+    pair = (model_from, effort_from)
+    if pair == ("--model", "--effort"):
+        return "set on the command line"
+    if pair == ("CODEX_REVIEW_MODEL", "CODEX_REVIEW_EFFORT"):
+        return "CODEX_REVIEW_MODEL/CODEX_REVIEW_EFFORT"
+    if pair == (None, None):
+        return default
+    return f"model from {model_from or fallback}, effort from {effort_from or fallback}"
+
+
+def _explicit(cli_model, cli_effort):
+    """True when the command line picks the model or effort (`--model auto` does not)."""
+    return cli_model not in (None, "auto") or bool(cli_effort)
+
+
+def refuse_idle_tier(tier, explicit):
+    """Exit 2 when --tier would be silently ignored: --model or --effort turn automatic
+    selection off, so a tier given alongside them would steer nothing."""
+    if tier and explicit:
+        _bad_args("--tier does nothing here: --model and --effort turn automatic selection "
+                  "off. Drop --tier, or drop --model/--effort.")
+
+
+def select_for(profile, *, cli_model, cli_effort, tier, catalog, route):
+    """(model, effort, source, usage) for a run that is not a pinned review.
+
+    --model or --effort turns automatic selection off for the run; the missing half comes
+    from the profile's standard rung. Otherwise the tier is --tier or the router's, and
+    selection.auto_pick applies the headroom step-down and the catalog fallback."""
+    model = None if cli_model in (None, "auto") else cli_model
+    if model or cli_effort:
+        source = describe_source("--model" if model else None,
+                                 "--effort" if cli_effort else None,
+                                 default="set on the command line",
+                                 fallback="the standard rung")
+        model, effort = selection.fill_explicit(profile, model, cli_effort)
+        validate_choice(model, effort, catalog)
+        return model, effort, source, None
+    preflight_auto(profile, tier, catalog)
+    usage = None
+    if tier:
+        tier_source = "--tier"
+    else:
+        tier, tier_source, usage = route()
+    try:
+        model, effort, used, notes = selection.auto_pick(
+            profile, tier, current_headroom(), catalog, time.time())
+    except selection.SelectionError as exc:
+        _bad_args(str(exc))
+    return model, effort, "; ".join([f"tier {used} from {tier_source}", *notes]), usage
 
 
 def topic_slug(value):
@@ -438,17 +710,84 @@ def topic_slug(value):
     return value
 
 
-def findings_path(cwd, topic, out_dir=DEFAULT_OUT_DIR):
-    reviews = cwd / out_dir
-    reviews.mkdir(parents=True, exist_ok=True)
-    return reviews / f"{date.today().isoformat()}-{topic}-codex-review.md"
+def output_path(cwd, action, topic, out_dir=None):
+    """Where an action's output goes: `out_dir` (a run's --out-dir) or the action's default
+    directory, relative to --cwd. Computes only: the directory is created inside
+    append_section's recovery block, so a failed mkdir after a paid call prints the result
+    instead of losing it."""
+    spec = ACTIONS[action]
+    return (cwd / (out_dir or spec["dir"])
+            / f"{date.today().isoformat()}-{topic}-{spec['suffix']}.md")
+
+
+def findings_path(cwd, topic, out_dir=None):
+    return output_path(cwd, "review", topic, out_dir)
+
+
+def append_section(path, title, section):
+    """Append one section, writing the title first when the file is new or empty. Recreates a
+    deleted directory: state outlives a checkout, and a paid result must not be lost."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fresh = not path.exists() or path.stat().st_size == 0
+    with path.open("a") as f:
+        if fresh:
+            f.write(f"# {title}\n\n")
+        f.write(section.rstrip() + "\n\n")
+
+
+def run_round(*, action, cwd, codex, timeout, origin, branch, topic, state, prompt, model,
+              effort, web_search, round_kind, heading, usage_extra=None, usage_mode=None,
+              needs_thread=False, out_dir=None):
+    """One threaded round, shared by reviews, research, and eval advise: start or resume the
+    topic's thread (`state` from preload_state), append the output under heading(round_no),
+    save state, then print the completion line, the usage line, and (last) the output
+    path."""
+    spath = state_path(origin, branch, topic, action)
+    if needs_thread and state is None:
+        print(f"no review thread for topic '{topic}' on this branch; "
+              "start a new review with --kind plan|design|implementation", file=sys.stderr)
+        raise SystemExit(3)
+    if state is None:
+        cmd_prefix = [codex, "exec"]
+    else:
+        cmd_prefix = [codex, "exec", "resume", state["thread_id"]]
+    thread_id, text, usage = run_codex(cmd_prefix, prompt, cwd, timeout, model, effort, topic,
+                                       web_search=web_search)
+    if state is None and not usable(thread_id):
+        sys.stderr.write(text)
+        sys.exit("codex emitted no thread.started event, so this review cannot be resumed; "
+                 "the review text above was printed rather than saved, and no state was changed"
+                 "\n" + _version_note(codex))
+    now = time.time()
+    if state is None:
+        state = {"thread_id": thread_id, "origin": origin, "branch": branch, "topic": topic,
+                 "findings_file": str(output_path(cwd, action, topic, out_dir)),
+                 "created": now,
+                 "rounds": []}
+    state["last_used"] = now
+    state["rounds"].append({"ts": now, "kind": round_kind})
+    findings = Path(state["findings_file"])
+    round_no = len(state["rounds"])
+    section = heading(round_no) + text.rstrip()
+    try:
+        append_section(findings, f"{ACTIONS[action]['title']}: {topic}", section)
+    except OSError as exc:
+        print(f"could not write the findings file {findings} ({exc}); the review text was "
+              "printed below instead, and no state was changed", file=sys.stderr)
+        print(section)
+        raise SystemExit(1)
+    save_state(spath, state)
+    print(f"round {round_no} ({round_kind}) complete, thread {state['thread_id']}, "
+          f"model {model} effort {effort}")
+    _print_usage(selection.sum_usage(usage, usage_extra), usage_mode)
+    print(findings)
 
 
 # The codex-cli version this tool was last exercised against end to end. The model is
 # pinned above; the CLI is whatever is installed, and a CLI change is the usual cause of a
 # break no flag explains (0.153.3 began reading a non-terminal stdin before its first turn).
 # Every failure message names the running version and whether it is this one.
-VALIDATED_CODEX_CLI = "0.153.3"
+VALIDATED_CODEX_CLI = "0.156.1"
 
 
 def codex_cli_version(codex_bin):
@@ -544,7 +883,35 @@ def _timeout_message(timeout, out, stderr_text, codex_bin):
     return "\n".join(lines)
 
 
-def run_codex(cmd_prefix, prompt, cwd, timeout, model, effort, topic=None):
+# codex takes the prompt as one command-line argument (stdin stays closed on purpose), and
+# macOS caps all arguments plus the environment at 1 MB.
+MAX_PROMPT_BYTES = 800 * 1024
+
+
+def check_prompt_size(prompt):
+    """Exit 2 when a rendered prompt is too large to pass to codex. Actions call it before
+    any paid call, the router included; run_codex calls it again as the last guard."""
+    if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+        _bad_args(f"the rendered prompt is over {MAX_PROMPT_BYTES} bytes; codex takes it as a "
+                  "command-line argument, so trim the inputs")
+
+
+class CodexCallFailed(SystemExit):
+    """A failed codex call: a non-zero exit, a timeout, or an empty answer. Uncaught, it
+    behaves exactly like sys.exit(message): the message on stderr and exit 1. It carries the
+    usage codex reported before failing, so a caller that recovers (the router, the judge)
+    still counts what the call spent. Callers that recover catch THIS type only: a plain
+    SystemExit is a stop signal (the handler's SystemExit(130)) or a refusal, and must
+    propagate, or a cancelled run would carry on and keep spending."""
+
+    def __init__(self, message, usage=None):
+        super().__init__(message)
+        self.usage = usage
+
+
+def run_codex(cmd_prefix, prompt, cwd, timeout, model, effort, topic=None, *,
+              web_search="disabled", ephemeral=False, schema=None):
+    check_prompt_size(prompt)
     with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as f:
         out_file = f.name
     cmd = cmd_prefix + [
@@ -552,9 +919,16 @@ def run_codex(cmd_prefix, prompt, cwd, timeout, model, effort, topic=None):
         "-m", model,
         "-c", f'model_reasoning_effort="{effort}"',
         "-c", 'sandbox_mode="read-only"',
-        "-o", out_file,
-        prompt,
+        # Always explicit: a web_search setting in ~/.codex/config.toml must never turn
+        # search on for a run that did not ask for it.
+        "-c", f'web_search="{web_search}"',
     ]
+    if ephemeral:
+        # One-shot runs (the router, eval compare) keep no session and may run outside a repo.
+        cmd += ["--ephemeral", "--skip-git-repo-check"]
+    if schema is not None:
+        cmd += ["--output-schema", str(schema)]
+    cmd += ["-o", out_file, prompt]
     # Popen (not subprocess.run) so the codex child is tracked in the run registry and can
     # be stopped by `kill` or by a stop signal to this wrapper (see _install_run_cleanup).
     # codex stays in this process's group, so a foreground timeout that group-kills the
@@ -601,7 +975,8 @@ def run_codex(cmd_prefix, prompt, cwd, timeout, model, effort, topic=None):
             except subprocess.TimeoutExpired:
                 pass
         os.unlink(out_file)
-        sys.exit(_timeout_message(timeout, out, stderr_text, cmd[0]))
+        raise CodexCallFailed(_timeout_message(timeout, out, stderr_text, cmd[0]),
+                              extract_usage(_parse_events(out or "")[0]))
     finally:
         _TRACKED_CHILD_PIDS.discard(proc.pid)
         _remove_run_marker(marker)
@@ -620,12 +995,12 @@ def run_codex(cmd_prefix, prompt, cwd, timeout, model, effort, topic=None):
         if any(marker in haystack for marker in AUTH_MARKERS):
             message += ("\ncodex authentication looks expired or revoked: "
                         "run `codex login` and retry this round")
-        sys.exit(message + "\n" + _version_note(cmd[0]))
+        raise CodexCallFailed(message + "\n" + _version_note(cmd[0]), extract_usage(events))
     review = Path(out_file).read_text()
     os.unlink(out_file)
     if not review.strip():
-        sys.exit("codex returned an empty review; no state was changed\n"
-                 + _version_note(cmd[0]))
+        raise CodexCallFailed("codex returned an empty review; no state was changed\n"
+                              + _version_note(cmd[0]), extract_usage(events))
     return thread_id, review, extract_usage(events)
 
 
@@ -938,6 +1313,389 @@ def _kill_subcommand(argv):
 
 
 
+def _action_parser(name, description, *, prompt_inputs=False):
+    parser = argparse.ArgumentParser(prog=f"run_review.py {name}", description=description)
+    parser.add_argument("--topic", required=True, type=topic_slug,
+                        help="kebab-case topic slug, stable across follow-ups")
+    parser.add_argument("--ask", default="", help="the question, or what to look at")
+    parser.add_argument("--doc", action="append", default=[], dest="docs",
+                        help="context path relative to --cwd (repeatable)")
+    parser.add_argument("--cwd", default=".", help="the git worktree to run in")
+    parser.add_argument("--model", default=None,
+                        help="explicit model; turns automatic selection off")
+    parser.add_argument("--effort", default=None,
+                        help="explicit effort; turns automatic selection off")
+    parser.add_argument("--tier", choices=selection.TIERS, default=None,
+                        help="light|standard|deep; skips the router")
+    parser.add_argument("--usage", nargs="?", const="text", default=None,
+                        choices=("text", "json"), help="print a fuller token-usage breakdown")
+    parser.add_argument("--out-dir", default=None, dest="out_dir",
+                        help="where the output file is written, relative to --cwd "
+                             "(default: the action's directory under .codex-review/)")
+    if prompt_inputs:
+        parser.add_argument("--prompt", required=True, dest="prompt_file",
+                            help="the prompt under test (absolute, or relative to --cwd)")
+        parser.add_argument("--result", default=None, dest="result_file",
+                            help="an existing output of the prompt")
+    return parser
+
+
+def _action_context(args):
+    """The shared start of every paid action. Everything here is free: the worktree
+    identity and the catalog read both happen before any spend."""
+    cwd = Path(args.cwd).resolve()
+    origin, branch = repo_identity(cwd)
+    codex = env("CODEX_BIN", "codex")
+    catalog = load_catalog(codex)
+    _install_run_cleanup()
+    return cwd, codex, int(env("CODEX_REVIEW_TIMEOUT", "3600")), origin, branch, catalog
+
+
+def _research_subcommand(argv):
+    args = _action_parser(
+        "research", "Answer a question with web search, threaded per topic.").parse_args(argv)
+    if not args.ask.strip():
+        _bad_args("research needs --ask with the question")
+    refuse_idle_tier(args.tier, _explicit(args.model, args.effort))
+    cwd, codex, timeout, origin, branch, catalog = _action_context(args)
+    prompt = render_text(load_template("research"),
+                         {"ASK": args.ask.strip(), "DOCS": doc_list(args.docs)})
+    check_prompt_size(prompt)  # before selection, which may pay for a router call
+    state = preload_state(origin, branch, args.topic, "research")
+    route = make_router(codex, action="research", ask=args.ask, docs=args.docs, cwd=cwd,
+                        research=True, catalog=catalog, topic=args.topic, timeout=timeout)
+    model, effort, source, router_usage = select_for(
+        "research", cli_model=args.model, cli_effort=args.effort, tier=args.tier,
+        catalog=catalog, route=route)
+    print(f"selected {model} / {effort} ({source})")
+    today = date.today().isoformat()
+    run_round(action="research", cwd=cwd, codex=codex, timeout=timeout, origin=origin,
+              branch=branch, topic=args.topic, state=state, prompt=prompt, model=model,
+              effort=effort,
+              web_search="live", round_kind="research",
+              heading=lambda n: (f"## Round {n} ({today}, research)\n\n"
+                                 f"Model: {model} / {effort} ({source})\n\n"),
+              usage_extra=router_usage, usage_mode=args.usage, out_dir=args.out_dir)
+    return 0
+
+
+# Each --prompt/--result file; the rendered prompt is capped separately (MAX_PROMPT_BYTES).
+MAX_INPUT_BYTES = 150 * 1024
+
+
+def input_path(cwd, path):
+    """--prompt/--result paths: absolute as given, relative ones against --cwd like --doc."""
+    candidate = Path(path)
+    return candidate if candidate.is_absolute() else cwd / candidate
+
+
+def read_input(path, flag):
+    """A --prompt/--result file as text, checked before any spend: readable, at most
+    MAX_INPUT_BYTES, no NUL bytes (codex takes the prompt as an argument), UTF-8."""
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        _bad_args(f"{flag} {path} could not be read ({exc.strerror or exc})")
+    if len(data) > MAX_INPUT_BYTES:
+        _bad_args(f"{flag} {path} is {len(data)} bytes; the limit is {MAX_INPUT_BYTES}")
+    if b"\x00" in data:
+        _bad_args(f"{flag} {path} contains NUL bytes; pass a text file")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        _bad_args(f"{flag} {path} is not UTF-8 text")
+
+
+def _eval_subcommand(argv):
+    if not argv or argv[0] not in ("advise", "compare"):
+        _bad_args("usage: run_review.py eval advise|compare --topic T --prompt FILE [...]")
+    return _eval_advise(argv[1:]) if argv[0] == "advise" else _eval_compare(argv[1:])
+
+
+def _eval_advise(argv):
+    parser = _action_parser("eval advise", "Critique a prompt and return a revised version, "
+                            "threaded per topic.", prompt_inputs=True)
+    parser.add_argument("--research", action="store_true",
+                        help="let codex use web search for outside facts")
+    args = parser.parse_args(argv)
+    refuse_idle_tier(args.tier, _explicit(args.model, args.effort))
+    cwd, codex, timeout, origin, branch, catalog = _action_context(args)
+    prompt_text = read_input(input_path(cwd, args.prompt_file), "--prompt")
+    result_text = (read_input(input_path(cwd, args.result_file), "--result")
+                   if args.result_file else None)
+    nonce = secrets.token_hex(4)
+    prompt = render_text(load_template("eval-advise"), {
+        "ASK": args.ask.strip() or "None.",
+        "DOCS": doc_list(args.docs),
+        "PROMPT": fence("PROMPT-UNDER-TEST", prompt_text, nonce),
+        "RESULT": (fence("OUTPUT", result_text, nonce) if result_text is not None
+                   else "None provided."),
+    })
+    if args.research:
+        prompt += "\n\n" + load_template("research-addendum")
+    # Two inputs under their own cap can still overflow the rendered prompt; the router only
+    # sees 2,000 characters, so check the real prompt before selection may pay for routing.
+    check_prompt_size(prompt)
+    state = preload_state(origin, branch, args.topic, "eval")
+    route = make_router(codex, action="eval advise", ask=args.ask, docs=args.docs, cwd=cwd,
+                        research=args.research, catalog=catalog, topic=args.topic,
+                        timeout=timeout, prompt_under_test=prompt_text)
+    model, effort, source, router_usage = select_for(
+        "eval-advise", cli_model=args.model, cli_effort=args.effort, tier=args.tier,
+        catalog=catalog, route=route)
+    print(f"selected {model} / {effort} ({source})")
+    today = date.today().isoformat()
+    run_round(action="eval", cwd=cwd, codex=codex, timeout=timeout, origin=origin,
+              branch=branch, topic=args.topic, state=state, prompt=prompt, model=model,
+              effort=effort, web_search="live" if args.research else "disabled",
+              round_kind="advise",
+              heading=lambda n: (f"## Advise round {n} ({today})\n\n"
+                                 f"Prompt: `{args.prompt_file}`\n\n"
+                                 f"Model: {model} / {effort} ({source})\n\n"),
+              usage_extra=router_usage, usage_mode=args.usage, out_dir=args.out_dir)
+    return 0
+
+
+DEFAULT_CRITERIA = "- Correctness\n- Completeness\n- Instruction-following\n- Concision"
+
+
+def label_rng():
+    """SystemRandom, unless CODEX_REVIEW_LABEL_SEED pins it: tests force both label orders.
+    Called before any paid step, so a bad inherited value costs nothing."""
+    seed = env("CODEX_REVIEW_LABEL_SEED", "")
+    if not seed:
+        return random.SystemRandom()
+    try:
+        return random.Random(int(seed))
+    except ValueError:
+        _bad_args(f"CODEX_REVIEW_LABEL_SEED must be an integer, got {seed!r}")
+
+
+def _judge_prompt(prompt_text, response_a, response_b, criteria, nonce):
+    return render_text(load_template("eval-judge"), {
+        "PROMPT": fence("PROMPT", prompt_text, nonce),
+        "A": fence("RESPONSE-A", response_a, nonce),
+        "B": fence("RESPONSE-B", response_b, nonce),
+        "CRITERIA": criteria,
+    })
+
+
+def _save_eval(out, topic, body):
+    """Append one compare section. When the file cannot be written, print the section
+    instead so a paid result is never lost, and return False."""
+    try:
+        append_section(out, f"Codex eval: {topic}", body)
+        return True
+    except OSError as exc:
+        print(f"could not write the eval file {out} ({exc}); the output was printed below "
+              "instead", file=sys.stderr)
+        print(body)
+        return False
+
+
+def _eval_compare(argv):
+    parser = _action_parser("eval compare", "Run a prompt through codex; with --result, judge "
+                            "the two outputs blind.", prompt_inputs=True)
+    parser.add_argument("--judge-model", default=None, help="explicit judge model")
+    parser.add_argument("--judge-effort", default=None, help="explicit judge effort")
+    args = parser.parse_args(argv)
+    if (args.judge_model or args.judge_effort) and not args.result_file:
+        _bad_args("--judge-model and --judge-effort need --result: without an existing "
+                  "result there is nothing to judge")
+    # --tier steers whichever step selects automatically; it is idle only when generate is
+    # explicit and no automatic judge will run.
+    auto_judge = bool(args.result_file) and not (args.judge_model or args.judge_effort)
+    refuse_idle_tier(args.tier, _explicit(args.model, args.effort) and not auto_judge)
+    if args.docs:
+        _bad_args("eval compare takes no --doc: the prompt runs as written, and the judge runs "
+                  "outside the repository so it cannot learn which result is which")
+    cwd, codex, timeout, _origin, _branch, catalog = _action_context(args)
+    prompt_text = read_input(input_path(cwd, args.prompt_file), "--prompt")
+    result_text = (read_input(input_path(cwd, args.result_file), "--result")
+                   if args.result_file else None)
+    criteria = args.ask.strip() or DEFAULT_CRITERIA
+    rng = label_rng() if result_text is not None else None
+    if result_text is not None:
+        # Everything in the judge prompt but codex's answer is known now; check it before
+        # generation is paid. run_codex still guards the full prompt later.
+        check_prompt_size(_judge_prompt(prompt_text, result_text, "", criteria, "0" * 8))
+        if not (args.judge_model or args.judge_effort):
+            # The judge is selected after generate, which may pay for routing; make sure an
+            # automatic judge can run before anything is paid.
+            preflight_auto("eval-judge", args.tier, catalog)
+    route = make_router(codex, action="eval compare", ask=args.ask, docs=args.docs, cwd=cwd,
+                        research=False, catalog=catalog, topic=args.topic, timeout=timeout,
+                        prompt_under_test=prompt_text)
+    judge = None
+    if result_text is not None and (args.judge_model or args.judge_effort):
+        # Explicit judge flags never route, so checking them first means a bad one costs
+        # nothing, not even the router call the generate selection may make.
+        judge = select_for("eval-judge", cli_model=args.judge_model,
+                           cli_effort=args.judge_effort, tier=args.tier, catalog=catalog,
+                           route=route)
+    gen_model, gen_effort, gen_source, route_usage = select_for(
+        "eval-generate", cli_model=args.model, cli_effort=args.effort, tier=args.tier,
+        catalog=catalog, route=route)
+    if result_text is not None and judge is None:
+        judge = select_for("eval-judge", cli_model=None, cli_effort=None, tier=args.tier,
+                           catalog=catalog, route=route)
+    print(f"selected {gen_model} / {gen_effort} to generate ({gen_source})")
+    if judge:
+        print(f"selected {judge[0]} / {judge[1]} to judge ({judge[2]})")
+    _thread, codex_result, gen_usage = run_codex(
+        [codex, "exec"], prompt_text, cwd, timeout, gen_model, gen_effort, args.topic,
+        ephemeral=True)
+    usages = [route_usage, gen_usage]
+    codex_name = f"codex ({gen_model}/{gen_effort})"
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    heading = f"## Compare ({stamp}, generate {gen_model}/{gen_effort}"
+    heading += f", judge {judge[0]}/{judge[1]})" if judge else ")"
+    lines = [heading, "", f"Prompt: `{args.prompt_file}`"]
+    if judge:
+        lines.append(f"Existing result: `{args.result_file}`")
+    lines.append(f"Generate: {gen_model} / {gen_effort} ({gen_source})")
+    if judge:
+        lines.append(f"Judge: {judge[0]} / {judge[1]} ({judge[2]})")
+    lines += ["", "### Codex result", "", codex_result.rstrip()]
+    exit_code = 0
+    if judge:
+        judge_model, judge_effort, _source, judge_route_usage = judge
+        usages.append(judge_route_usage)
+        labels = selection.assign_labels(rng)
+        texts = {"existing": result_text, "codex": codex_result}
+        judge_prompt = _judge_prompt(prompt_text, texts[labels["A"]], texts[labels["B"]],
+                                     criteria, secrets.token_hex(4))
+        lines += ["", "### Verdict", ""]
+        try:
+            # An empty directory, not the worktree: there the judge could open the --result
+            # file and learn which side is which. It needs nothing but the prompt.
+            with tempfile.TemporaryDirectory() as blind:
+                _thread, verdict_text, judge_usage = run_codex(
+                    [codex, "exec"], judge_prompt, Path(blind), timeout, judge_model,
+                    judge_effort, args.topic, ephemeral=True,
+                    schema=SCHEMAS / "judge.schema.json")
+        except CodexCallFailed as exc:
+            # The codex result above is already paid for: keep it and say what failed. A
+            # failed call can still have spent, and CodexCallFailed carries that usage.
+            print(exc.code, file=sys.stderr)
+            usages.append(exc.usage)
+            lines.append(f"The judge run failed, so there is no verdict: "
+                         f"{_first_line(exc.code)}")
+            exit_code = 1
+        except SystemExit:
+            # A stop signal, not a failure: save the paid codex result, then stop as asked.
+            lines.append("The judge run was interrupted, so there is no verdict.")
+            _save_eval(output_path(cwd, "eval", args.topic, args.out_dir), args.topic, "\n".join(lines))
+            raise
+        else:
+            usages.append(judge_usage)
+            try:
+                verdict = selection.unblind(selection.parse_verdict(verdict_text), labels,
+                                            codex_name)
+                lines.append(selection.render_verdict(verdict, labels, codex_name))
+            except selection.SelectionError as exc:
+                names = selection.label_names(labels, codex_name)
+                lines += [f"The judge's verdict did not match the expected shape ({exc}), so "
+                          f"it is recorded raw. Labels: A = {names['A']}, B = {names['B']}.",
+                          "", "```", verdict_text.rstrip(), "```"]
+    out = output_path(cwd, "eval", args.topic, args.out_dir)
+    if not _save_eval(out, args.topic, "\n".join(lines)):
+        raise SystemExit(1)
+    done = f"compare complete, generate {gen_model} effort {gen_effort}"
+    if judge:
+        done += f", judge {judge[0]} effort {judge[1]}"
+    print(done)
+    _print_usage(selection.sum_usage(*usages), args.usage)
+    print(out)
+    return exit_code
+
+
+ADVISE_ACTIONS = {
+    "review": ("review",),
+    "research": ("research",),
+    "eval-advise": ("eval-advise",),
+    "eval-compare": ("eval-generate", "eval-judge"),
+}
+
+
+def build_advice(action_names, tier, catalog, headroom, now):
+    """What each action would run on, as data. Calls no model."""
+    report = {"catalog": "live" if catalog.live else "unavailable", "headroom": headroom,
+              "tier": tier, "actions": {}}
+    for action in action_names:
+        entries = []
+        for profile in ADVISE_ACTIONS[action]:
+            ladder = [{"tier": t, "model": m, "effort": e, "available": catalog.supports(m, e)}
+                      for t, (m, e) in selection.LADDERS[profile].items()]
+            if profile == "review":
+                # What a pinned review would really run: the env vars apply, as in a run.
+                model, effort = resolve_model_effort(None, None)
+                from_env = [name for name in ("CODEX_REVIEW_MODEL", "CODEX_REVIEW_EFFORT")
+                            if env(name, "")]
+                notes = ["from " + " and ".join(from_env) if from_env
+                         else "pinned review default",
+                         "the ladder applies only with --model auto"]
+                if catalog.live and not catalog.supports(model, effort):
+                    notes.append(f"{model} / {effort} is not in the codex catalog: a review "
+                                 "would exit 2")
+                if headroom:
+                    notes.append("near a limit: reviews warn but never step down")
+                pick = {"model": model, "effort": effort, "tier": None, "notes": notes}
+            else:
+                try:
+                    model, effort, used, notes = selection.auto_pick(
+                        profile, tier, headroom, catalog, now)
+                    pick = {"model": model, "effort": effort, "tier": used, "notes": notes}
+                except selection.SelectionError as exc:
+                    pick = {"error": str(exc)}
+            entries.append({"profile": profile, "ladder": ladder, "pick": pick})
+        report["actions"][action] = entries
+    return report
+
+
+def format_advice(report, now):
+    lines = [f"model catalog: {report['catalog']}"]
+    if report["headroom"]:
+        lines.append("codex usage: near its limit (%s)"
+                     % selection.describe_headroom(report["headroom"], now))
+    else:
+        lines.append("codex usage: no window near its limit")
+    lines.append(f"tier: {report['tier']} ({report['tier_from']})")
+    for action, entries in report["actions"].items():
+        lines += ["", action]
+        for entry in entries:
+            lines.append(f"  {entry['profile']}")
+            for rung in entry["ladder"]:
+                mark = "" if rung["available"] else "  [not in catalog]"
+                lines.append(f"    {rung['tier']:<9}{rung['model']} / {rung['effort']}{mark}")
+            pick = entry["pick"]
+            if "error" in pick:
+                lines.append(f"    pick: none ({pick['error']})")
+                continue
+            lines.append(f"    pick: {pick['model']} / {pick['effort']}")
+            lines += [f"      {note}" for note in pick["notes"]]
+    return "\n".join(lines)
+
+
+def _advise_subcommand(argv):
+    parser = argparse.ArgumentParser(
+        prog="run_review.py advise",
+        description="Show what automatic model selection picks for each action and why. "
+                    "Calls no model and spends nothing.")
+    parser.add_argument("action", nargs="?", choices=list(ADVISE_ACTIONS))
+    parser.add_argument("--tier", choices=selection.TIERS, default=None)
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    args = parser.parse_args(argv)
+    catalog = load_catalog(env("CODEX_BIN", "codex"))
+    now = time.time()
+    report = build_advice([args.action] if args.action else list(ADVISE_ACTIONS),
+                          args.tier or "standard", catalog, current_headroom(), now)
+    report["tier_from"] = ("--tier" if args.tier
+                           else "standard shown; a run without --tier asks the router")
+    print(json.dumps(report, indent=2) if args.json else format_advice(report, now))
+    return 0
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "limits":
         raise SystemExit(_limits_subcommand(sys.argv[2:]))
@@ -947,6 +1705,20 @@ def main():
 
     if len(sys.argv) > 1 and sys.argv[1] == "kill":
         raise SystemExit(_kill_subcommand(sys.argv[2:]))
+
+    if len(sys.argv) > 1 and sys.argv[1] == "research":
+        raise SystemExit(_research_subcommand(sys.argv[2:]))
+
+    if len(sys.argv) > 1 and sys.argv[1] == "eval":
+        raise SystemExit(_eval_subcommand(sys.argv[2:]))
+
+    if len(sys.argv) > 1 and sys.argv[1] in ("eval-advise", "eval-compare"):
+        # The same actions without a bare `eval` word, which some agent shell guards refuse
+        # as the shell builtin. SKILL.md documents these forms.
+        raise SystemExit(_eval_subcommand([sys.argv[1][len("eval-"):], *sys.argv[2:]]))
+
+    if len(sys.argv) > 1 and sys.argv[1] == "advise":
+        raise SystemExit(_advise_subcommand(sys.argv[2:]))
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kind", required=True, choices=KINDS)
@@ -962,7 +1734,8 @@ def main():
     parser.add_argument("--model", default=None,
                         help="reviewer model (default %s, or CODEX_REVIEW_MODEL); the "
                              "default is heavier reasoning for a better review, but any "
-                             "codex model may be selected" % DEFAULT_MODEL)
+                             "codex model may be selected; 'auto' selects from the review "
+                             "ladder (see --tier)" % DEFAULT_MODEL)
     parser.add_argument("--effort", default=None,
                         help="reasoning effort %s (default %s, or CODEX_REVIEW_EFFORT)"
                              % ("|".join(EFFORTS), DEFAULT_EFFORT))
@@ -970,85 +1743,67 @@ def main():
                         choices=("text", "json"),
                         help="print a fuller token-usage breakdown (text|json); a one-line "
                              "usage summary always prints regardless")
+    parser.add_argument("--research", action="store_true",
+                        help="let the reviewer use web search when a finding depends on an "
+                             "outside fact")
+    parser.add_argument("--tier", choices=selection.TIERS, default=None,
+                        help="with --model auto: light|standard|deep, skipping the router")
     args = parser.parse_args()
+    if args.tier and args.model != "auto":
+        _bad_args("--tier applies only with --model auto")
+    refuse_idle_tier(args.tier, bool(args.effort))
 
     cwd = Path(args.cwd).resolve()
     codex = env("CODEX_BIN", "codex")
     timeout = int(env("CODEX_REVIEW_TIMEOUT", "3600"))
-    args.model, args.effort = resolve_model_effort(args.model, args.effort)
     args.out_dir = args.out_dir or env("CODEX_REVIEW_OUT_DIR", DEFAULT_OUT_DIR)
     # A review is a long, paid run; make sure a stop signal to this wrapper tears down the
     # codex child + the run marker (so a cancelled background run never keeps spending).
     _install_run_cleanup()
+    origin, branch = repo_identity(cwd)
 
-    try:
-        origin = sanitize_origin(git(cwd, "remote", "get-url", "origin"))
-    except subprocess.CalledProcessError:
-        origin = str(cwd)
-    branch = git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
-
-    prune_stale()
-    spath = state_path(origin, branch, args.topic)
-    state = load_state(spath)
-
+    catalog = load_catalog(codex)
+    # Rendered and size-checked before selection, since selection may pay for a router call.
+    prompt = render(args.kind, args.topic, args.docs, args.ask)
+    if args.research:
+        prompt += "\n\n" + load_template("research-addendum")
+    check_prompt_size(prompt)
+    # Pruned and loaded before selection, so --model auto never pays for routing a fix-round
+    # whose thread is missing, expired, or corrupt.
+    state = preload_state(origin, branch, args.topic)
     if args.kind == "fix-round" and state is None:
         print(f"no review thread for topic '{args.topic}' on this branch; "
-              "start a new review with --kind plan|design|implementation", file=sys.stderr)
+              f"{REVIEW_RESTART}", file=sys.stderr)
         raise SystemExit(3)
-
-    prompt = render(args.kind, args.topic, args.docs, args.ask)
-    if state is None:
-        cmd_prefix = [codex, "exec"]
+    router_usage = None
+    if args.model == "auto":
+        route = make_router(codex, action=f"{args.kind} review", ask=args.ask,
+                            docs=args.docs, cwd=cwd, research=args.research,
+                            catalog=catalog, topic=args.topic, timeout=timeout)
+        args.model, args.effort, model_source, router_usage = select_for(
+            "review", cli_model=None, cli_effort=args.effort, tier=args.tier,
+            catalog=catalog, route=route)
+        print(f"selected {args.model} / {args.effort} ({model_source})")
     else:
-        cmd_prefix = [codex, "exec", "resume", state["thread_id"]]
+        model_source = describe_source(
+            "--model" if args.model
+            else "CODEX_REVIEW_MODEL" if env("CODEX_REVIEW_MODEL", "") else None,
+            "--effort" if args.effort
+            else "CODEX_REVIEW_EFFORT" if env("CODEX_REVIEW_EFFORT", "") else None,
+            default="pinned review default", fallback="the pinned default")
+        args.model, args.effort = resolve_model_effort(args.model, args.effort)
+        validate_choice(args.model, args.effort, catalog)
+        warn_if_near_limit(args.model, args.effort)
 
-    thread_id, review, usage = run_codex(
-        cmd_prefix, prompt, cwd, timeout, args.model, args.effort, args.topic)
-
-    if state is None and not usable(thread_id):
-        sys.stderr.write(review)
-        sys.exit("codex emitted no thread.started event, so this review cannot be resumed; "
-                 "the review text above was printed rather than saved, and no state was changed"
-                 "\n" + _version_note(codex))
-
-    now = time.time()
-    if state is None:
-        state = {
-            "thread_id": thread_id,
-            "origin": origin,
-            "branch": branch,
-            "topic": args.topic,
-            "findings_file": str(findings_path(cwd, args.topic, args.out_dir)),
-            "created": now,
-            "rounds": [],
-        }
-    state["last_used"] = now
-    state["rounds"].append({"ts": now, "kind": args.kind})
-
-    findings = Path(state["findings_file"])
-    round_no = len(state["rounds"])
-    header = f"## Round {round_no} ({date.today().isoformat()}, {args.kind})\n\n"
-    # State outlives a checkout (30 days, keyed on origin+branch+topic), so a resumed round
-    # can find its stored findings directory gone (the tree was moved or cleaned). Recreate
-    # the directory rather than lose an already-paid round; if the write still fails, print
-    # the review instead of dropping it, and leave the state file untouched.
-    try:
-        findings.parent.mkdir(parents=True, exist_ok=True)
-        with findings.open("a") as f:
-            if round_no == 1:
-                f.write(f"# Codex review: {args.topic}\n\n")
-            f.write(header + review.rstrip() + "\n\n")
-    except OSError as exc:
-        print(f"could not write the findings file {findings} ({exc}); the review text was "
-              "printed below instead, and no state was changed", file=sys.stderr)
-        print(header + review.rstrip())
-        raise SystemExit(1)
-
-    save_state(spath, state)
-    print(f"round {round_no} ({args.kind}) complete, thread {state['thread_id']}, "
-          f"model {args.model} effort {args.effort}")
-    _print_usage(usage, args.usage)
-    print(findings)
+    today = date.today().isoformat()
+    run_round(action="review", cwd=cwd, codex=codex, timeout=timeout, origin=origin,
+              branch=branch, topic=args.topic, state=state, prompt=prompt, model=args.model,
+              effort=args.effort, web_search="live" if args.research else "disabled",
+              round_kind=args.kind,
+              heading=lambda n: (f"## Round {n} ({today}, {args.kind})\n\n"
+                                 f"Model: {args.model} / {args.effort} ({model_source})\n\n"),
+              usage_extra=router_usage, usage_mode=args.usage,
+              needs_thread=(args.kind == "fix-round"), out_dir=args.out_dir)
 
 
 if __name__ == "__main__":

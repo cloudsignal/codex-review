@@ -1,0 +1,39 @@
+{
+  "type": "object",
+  "properties": {
+    "criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "winner": {"type": "string", "enum": ["A", "B", "tie"]},
+          "why": {"type": "string"}
+        },
+        "required": ["name", "winner", "why"],
+        "additionalProperties": false
+      }
+    },
+    "overall": {
+      "type": "object",
+      "properties": {
+        "winner": {"type": "string", "enum": ["A", "B", "tie"]},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "why": {"type": "string"}
+      },
+      "required": ["winner", "confidence", "why"],
+      "additionalProperties": false
+    },
+    "missed": {
+      "type": "object",
+      "properties": {
+        "A": {"type": "array", "items": {"type": "string"}},
+        "B": {"type": "array", "items": {"type": "string"}}
+      },
+      "required": ["A", "B"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["criteria", "overall", "missed"],
+  "additionalProperties": false
+}

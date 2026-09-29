@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "properties": {
+    "tier": {"type": "string", "enum": ["light", "standard", "deep"]},
+    "reason": {"type": "string"}
+  },
+  "required": ["tier", "reason"],
+  "additionalProperties": false
+}

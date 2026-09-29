@@ -9,6 +9,7 @@ import time
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest import mock
 
 RUNNER = Path(__file__).resolve().parent.parent / "scripts" / "run_review.py"
 
@@ -40,6 +41,11 @@ if [ "${1:-}" = "--version" ]; then
   if [ -n "${STUB_VERSION_BYTES:-}" ]; then printf 'codex-cli \\xff0.0.0\\n'; exit 0; fi
   echo "${STUB_VERSION:-codex-cli 0.0.0-stub}"
   exit 0
+fi
+if [ "${1:-}" = "debug" ]; then
+  printf '%s\\n' "$@" >> "$STUB_LOG.debug"
+  if [ -n "${STUB_CATALOG:-}" ]; then cat "$STUB_CATALOG"; exit 0; fi
+  exit 1
 fi
 printf '%s\\n' "$@" >> "$STUB_LOG"
 if [ "${STUB_MODE:-ok}" = "hang" ]; then
@@ -108,6 +114,12 @@ fi
 printf 'STUB REVIEW FINDINGS\\n' > "$out"
 """
 
+LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
+CATALOG = json.dumps({"models": [
+    {"slug": "gpt-6-sol", "supported_reasoning_levels": [{"effort": e} for e in LEVELS]},
+    {"slug": "gpt-6-luna", "supported_reasoning_levels": [{"effort": e} for e in LEVELS[:-1]]},
+]})
+
 
 class RunReviewTest(unittest.TestCase):
     def setUp(self):
@@ -134,16 +146,18 @@ class RunReviewTest(unittest.TestCase):
         self.stub_log = self.tmp / "stub.log"
         self.stub_log.write_text("")
 
-    def run_review(self, *extra, env_extra=None, topic="thing", stdin=None):
+    def run_review(self, *extra, env_extra=None, topic="thing", stdin=None, cwd=None):
         env = dict(os.environ)
         env.update({
             "CODEX_BIN": str(self.stub),
             "CODEX_REVIEW_STATE_DIR": str(self.state_dir),
             "STUB_LOG": str(self.stub_log),
+            # Hermetic: never read the developer's real rate-limit snapshot.
+            "CODEX_HOME": str(self.tmp / "codex-home"),
         })
         env.update(env_extra or {})
         return subprocess.run(
-            [sys.executable, str(RUNNER), "--cwd", str(self.repo),
+            [sys.executable, str(RUNNER), "--cwd", str(cwd or self.repo),
              "--topic", topic, "--doc", "docs/thing.md", *extra],
             capture_output=True, text=True, env=env, stdin=stdin,
         )
@@ -202,7 +216,7 @@ class RunReviewTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         argv = self.stub_log.read_text().splitlines()
         self.assertIn("-m", argv)
-        self.assertIn("gpt-5.6-sol", argv)
+        self.assertIn("gpt-6-sol", argv)
         self.assertIn('model_reasoning_effort="xhigh"', argv)
         self.assertIn('sandbox_mode="read-only"', argv)
         self.assertIn("--json", argv)
@@ -545,7 +559,7 @@ class RunReviewTest(unittest.TestCase):
         argv = self.stub_log.read_text().splitlines()
         self.assertIn("cheap-model", argv)
         self.assertIn('model_reasoning_effort="low"', argv)
-        self.assertNotIn("gpt-5.6-sol", argv)
+        self.assertNotIn("gpt-6-sol", argv)
         self.assertNotIn('model_reasoning_effort="xhigh"', argv)
 
     def test_cli_model_effort_beats_env(self):
@@ -563,7 +577,7 @@ class RunReviewTest(unittest.TestCase):
 
     def test_invalid_effort_fails_before_codex(self):
         r = self.run_review("--kind", "plan", "--effort", "bogus")
-        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.returncode, 2)  # bad arguments, per SKILL.md
         self.assertIn("invalid effort", r.stderr)
         self.assertEqual(self.stub_log.read_text(), "")  # never reached codex
 
@@ -586,6 +600,157 @@ class RunReviewTest(unittest.TestCase):
         })
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('"input_tokens": 1200', r.stdout)
+
+    def catalog_env(self):
+        path = self.tmp / "catalog.json"
+        path.write_text(CATALOG)
+        return {"STUB_CATALOG": str(path)}
+
+    def write_snapshot(self, used_percent, resets_at):
+        day = self.tmp / "codex-home" / "sessions" / "2026" / "09" / "29"
+        day.mkdir(parents=True, exist_ok=True)
+        event = {"timestamp": "2026-09-29T10:00:00Z", "type": "event_msg",
+                 "payload": {"type": "token_count", "rate_limits": {"primary": {
+                     "used_percent": used_percent, "window_minutes": 300,
+                     "resets_at": resets_at}}}}
+        (day / "rollout-2026-09-29T10-00-00-x.jsonl").write_text(json.dumps(event) + "\n")
+
+    def argv(self):
+        return self.stub_log.read_text().splitlines()
+
+    def model_effort(self):
+        argv = self.argv()
+        effort = next(a for a in argv if a.startswith("model_reasoning_effort="))
+        return argv[argv.index("-m") + 1], effort.split('"')[1]
+
+    def test_review_default_is_gpt_6_sol_at_xhigh(self):
+        r = self.run_review("--kind", "plan", env_extra=self.catalog_env())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.model_effort(), ("gpt-6-sol", "xhigh"))
+
+    def test_effort_is_checked_against_the_chosen_model(self):
+        # ultra is valid for sol and not luna: one global effort list lets both through.
+        r = self.run_review("--kind", "plan", "--model", "gpt-6-luna", "--effort", "ultra",
+                            env_extra=self.catalog_env())
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("invalid effort 'ultra' for gpt-6-luna", r.stderr)
+        self.assertEqual(self.stub_log.read_text(), "")
+        r = self.run_review("--kind", "plan", "--model", "gpt-6-sol", "--effort", "ultra",
+                            env_extra=self.catalog_env())
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_model_missing_from_the_catalog_is_refused_before_codex(self):
+        r = self.run_review("--kind", "plan", "--model", "gpt-7-nope",
+                            env_extra=self.catalog_env())
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("not in the codex catalog", r.stderr)
+        self.assertIn("gpt-6-sol", r.stderr)
+        self.assertEqual(self.stub_log.read_text(), "")
+
+    def test_unavailable_catalog_falls_back_to_the_static_list(self):
+        r = self.run_review("--kind", "plan", "--model", "any-model", "--effort", "ultra")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("catalog unavailable", r.stderr)
+
+    def test_pinned_review_warns_near_a_limit_and_keeps_its_model(self):
+        self.write_snapshot(86.0, time.time() + 3600)
+        r = self.run_review("--kind", "plan", env_extra=self.catalog_env())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("near its limit", r.stderr)
+        self.assertEqual(self.model_effort(), ("gpt-6-sol", "xhigh"))
+
+    def test_warning_line_is_inclusive_and_ignores_reset_windows(self):
+        cases = [(80.0, 3600, "at-line", True), (79.9, 3600, "below", False),
+                 (95.0, -3600, "reset", False)]
+        for pct, offset, topic, warns in cases:
+            with self.subTest(topic):
+                self.write_snapshot(pct, time.time() + offset)
+                r = self.run_review("--kind", "plan", topic=topic)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual("near its limit" in r.stderr, warns, r.stderr)
+
+    def test_non_git_cwd_is_refused_before_codex(self):
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        # The .git directory: `rev-parse --abbrev-ref HEAD` succeeds there, so only a real
+        # worktree check refuses it.
+        for name, cwd in (("plain", plain), ("git-dir", self.repo / ".git")):
+            with self.subTest(name):
+                r = self.run_review("--kind", "plan", cwd=cwd)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("not a git worktree", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(self.stub_log.read_text(), "")
+
+    def test_review_default_is_sol_at_xhigh(self):
+        module = _runner_module()
+        with mock.patch.dict(os.environ, {"CODEX_REVIEW_MODEL": "", "CODEX_REVIEW_EFFORT": ""}):
+            self.assertEqual(module.resolve_model_effort(None, None), ("gpt-6-sol", "xhigh"))
+
+    def test_web_search_is_disabled_explicitly_by_default(self):
+        r = self.run_review("--kind", "plan")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('web_search="disabled"', self.argv())
+        self.assertNotIn("--ephemeral", self.argv())
+
+    def test_research_flag_turns_search_on_and_keeps_the_pinned_model(self):
+        r = self.run_review("--kind", "plan", "--research", env_extra=self.catalog_env())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('web_search="live"', self.argv())
+        self.assertEqual(self.model_effort(), ("gpt-6-sol", "xhigh"))
+        self.assertIn("Web search is available for this round", self.stub_log.read_text())
+
+    def test_network_in_inspect_mode_points_at_research(self):
+        r = self.run_review("--kind", "plan", "--network")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--research", r.stderr)
+        self.assertEqual(self.stub_log.read_text(), "")
+
+    def test_placeholder_text_in_caller_input_is_not_substituted(self):
+        # DOCS is filled before ASK; sequential str.replace would turn this into docs/focus.md.
+        r = self.run_review("--kind", "plan", "--ask", "focus", "--doc", "docs/{{ASK}}.md")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("- docs/{{ASK}}.md", self.stub_log.read_text())
+
+    def test_render_text_is_one_pass_in_either_order(self):
+        module = _runner_module()
+        # Each case defeats one sequential order; together they defeat both.
+        self.assertEqual(module.render_text("{{A}} {{B}}", {"A": "{{B}}", "B": "x"}), "{{B}} x")
+        self.assertEqual(module.render_text("{{A}} {{B}}", {"A": "y", "B": "{{A}}"}), "y {{A}}")
+
+    def test_oversized_prompt_is_refused_before_codex(self):
+        module = _runner_module()
+        with self.assertRaises(SystemExit) as ctx:
+            module.run_codex([str(self.stub), "exec"], "x" * (800 * 1024 + 1), self.repo, 5,
+                             "gpt-6-sol", "low")
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_usage_summary_stays_directly_above_the_path(self):
+        # Before this change the --usage breakdown printed after the summary, between it and
+        # the path; a test that only finds both lines passes that order.
+        r = self.run_review("--kind", "plan", "--usage", "json", env_extra={
+            "STUB_USAGE": '{"input_tokens":1200,"output_tokens":340}'})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = r.stdout.strip().splitlines()
+        self.assertTrue(lines[-2].startswith("usage: 1.2k in"), lines)
+        self.assertEqual(json.loads(lines[-3]), {"input_tokens": 1200, "output_tokens": 340})
+
+    def test_failed_call_keeps_the_usage_codex_reported(self):
+        module = _runner_module()
+        failing = self.tmp / "failing-codex"
+        failing.write_text(
+            "#!/bin/bash\n"
+            "echo '{\"type\":\"turn.failed\",\"error\":{\"message\":\"boom\"},"
+            "\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}'\n"
+            "exit 1\n")
+        failing.chmod(0o755)
+        with mock.patch.dict(os.environ, {"CODEX_REVIEW_STATE_DIR": str(self.state_dir)}):
+            with self.assertRaises(module.CodexCallFailed) as ctx:
+                module.run_codex([str(failing), "exec"], "prompt", self.repo, 30,
+                                 "gpt-6-sol", "low")
+        self.assertIsInstance(ctx.exception, SystemExit)  # uncaught, it still exits 1
+        self.assertIn("codex exited 1", str(ctx.exception.code))
+        self.assertEqual(ctx.exception.usage, {"input_tokens": 7, "output_tokens": 3})
 
 
 if __name__ == "__main__":

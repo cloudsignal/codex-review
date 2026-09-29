@@ -1,15 +1,16 @@
 ---
 name: codex-review
-description: Use when a plan, design, or implementation is ready for external review, or when the user asks for a code review, an external review, or another review round. Runs one round of an OpenAI Codex code review against the working tree in a read-only sandbox, and tracks the review thread across fix-and-re-review rounds.
+description: Use when a plan, design, or implementation is ready for external review; when the user asks for a code review, an external review, or another review round; when a prompt needs an outside critique or a second model's answer to compare against; or when a question needs a second model to research outside facts on the web.
 license: MIT
 ---
 
-# Codex code review
+# Codex review, eval, and research
 
-Run one review round, apply the findings, then run fix rounds on the same thread until clean.
-The reviewer is [OpenAI Codex](https://github.com/openai/codex) driven in a **read-only** sandbox:
-the model runs no commands that write to your tree. The tool itself writes only the findings file
-and its thread state, and sends the code under review to Codex.
+One runner drives [OpenAI Codex](https://github.com/openai/codex) in a **read-only** sandbox, for
+code reviews, prompt evals, and web research. The model runs no commands that write to your tree.
+The tool itself writes only its output file and its thread state, and sends the material under
+review to Codex. Reviews run on `gpt-6-sol` at `xhigh`. Every other action picks its own model and
+effort, and costs less when the task is small or the subscription is near its limit.
 
 ## Requirements
 
@@ -17,101 +18,112 @@ and its thread state, and sends the code under review to Codex.
 - Python 3.9+ (standard library only)
 - The `codex` CLI on `PATH`, authenticated once with `codex login`
 
-## Run a round
+## Actions
 
-1. Pick the review kind: `plan`, `design`, or `implementation` for a first round; `fix-round`
-   after applying findings from an earlier round.
-2. Pick a stable kebab-case topic slug for the whole review (one slug per feature; the thread and
-   the findings file key on it).
-3. Run (`--cwd` is the worktree to review):
+`R` below stands for `python3 scripts/run_review.py`.
 
-   ```bash
-   python3 scripts/run_review.py \
-     --kind <kind> --topic <slug> \
-     --doc <path> [--doc <path>...] \
-     --ask "<focus ask, or for fix-round: what was fixed since last round>" \
-     --cwd <worktree>
-   ```
+| Job | Command |
+|---|---|
+| Review a plan, design, or implementation | `R --kind plan\|design\|implementation --topic T --doc P [--doc P] --ask "<focus>" --cwd W` |
+| Re-review after applying fixes | `R --kind fix-round --topic T --doc P --ask "<what you fixed>" --cwd W` |
+| Research a question on the web | `R research --topic T --ask "<question>" --tier L --cwd W` |
+| Critique a prompt | `R eval-advise --topic T --prompt F [--result F] --ask "<what it is for>" --tier L --cwd W` |
+| See codex's answer to a prompt | `R eval-compare --topic T --prompt F --tier L --cwd W` |
+| Compare codex's answer with an existing one | the line above plus `--result F`, with criteria in `--ask` |
+| Preview model selection (free) | `R advise [review\|research\|eval-advise\|eval-compare] [--tier L]` |
+| Check subscription usage (free) | `R limits [--strict] [--json]` |
+| List or stop running jobs | `R runs`, `R kill <pid\|topic>` |
 
-4. **Run it as a BACKGROUND task, not a foreground call.** At the default `xhigh` effort a round
-   commonly takes **tens of minutes, sometimes 1-3 hours** on a real codebase, far longer than most
-   agent harnesses' synchronous command timeout. A foreground call will hit that ceiling and report
-   a timeout **even though codex is still working** (the review did not fail; the call just could
-   not wait). Launch it in the background and poll for completion. A background task is also tracked
-   and cancellable, so it is never an invisible runaway. If you need a bounded foreground pass, lower
-   the effort (`--effort medium` or `low`) so the round finishes in time, accepting a lighter review.
-5. The last stdout line is the findings file path. Read it and report the findings. The line above
-   it is a one-line token-usage summary (`usage: … in / … out (… total)`).
+- `--topic` is a kebab-case slug, the same across every round of one job.
+- `--cwd` is the git worktree. `--doc` and relative `--prompt`/`--result` paths resolve against it.
+- `--prompt` is the prompt exactly as it would run. For inline text, write it to a scratch file
+  first.
+- `eval-advise` and `eval-compare` are also spelled `eval advise` and `eval compare`. Prefer the
+  hyphenated forms: some agent shell guards refuse any command containing a bare `eval`.
+- The last stdout line is the output file and the line above it is the token usage. Read the
+  file and report it. `--usage` (or `--usage json`) adds a per-field breakdown above that line.
+- `R limits` reads codex's last rate-limit snapshot off disk, with no tokens and no network, and
+  shows OK, NEAR, or REACHED per window. It exits 1 when a limit is reached and 3 when there is
+  no snapshot yet; with `--strict` it also exits 1 when a window is near, so you can gate a long
+  paid run on it.
 
-### Options
+Outputs land under `--cwd` in `.codex-review/reviews/`, `.codex-review/research/`, or
+`.codex-review/evals/`, named `<date>-<topic>-codex-review.md`, `-codex-research.md`, or
+`-codex-eval.md`. `--out-dir` (relative to `--cwd`) overrides the directory for one run;
+`CODEX_REVIEW_OUT_DIR` overrides it for reviews. Reviews, research, and `eval-advise` keep one
+codex thread per topic, so a later run with the same topic continues the conversation.
 
-- `--model <name>` / `--effort <minimal|low|medium|high|xhigh>` select the reviewer and its
-  reasoning effort. Default is `gpt-5.6-sol` at `xhigh` (heavier reasoning = a better review);
-  override for a cheaper/faster pass. Precedence: CLI flag > `CODEX_REVIEW_MODEL` /
-  `CODEX_REVIEW_EFFORT` env > default. A bad `--effort` fails before Codex runs.
-- `--out-dir <dir>` sets where findings are written, relative to `--cwd` (default
-  `.codex-review/reviews/`, or `CODEX_REVIEW_OUT_DIR`).
-- `--usage [text|json]` prints a fuller token-usage breakdown after the one-line summary.
+## Choosing --tier
 
-## Check subscription usage (no review, no spend)
+Pass `--tier` on every research and eval run: it is free, and you know the task better than the
+router. Without it, a cheap router call (`gpt-6-luna` at `low`) picks the tier.
 
-```bash
-python3 scripts/run_review.py limits          # human summary
-python3 scripts/run_review.py limits --json    # machine-readable
-python3 scripts/run_review.py limits --strict  # also exit non-zero on NEAR
-```
+| Tier | Use for |
+|---|---|
+| `light` | a lookup-sized question, or a short prompt with one obvious answer |
+| `standard` | a normal multi-step question, or a prompt critique |
+| `deep` | open-ended synthesis, a security-relevant question, conflicting sources, or a prompt with many interacting constraints |
 
-Reads codex's last persisted rate-limit snapshot off disk, so it costs **no tokens and makes no
-network call**; it is as fresh as your last codex activity (the output states the timestamp). It
-prints the plan, each window's used-percent and reset time, and a status of `OK` / `NEAR` /
-`REACHED`. Exit: `0` normally, `1` on REACHED, `3` when no snapshot exists yet; `--strict` also
-exits `1` on NEAR, so an agent can gate a long paid review on remaining headroom.
+`--model` or `--effort` turns automatic selection off for the run, so `--tier` beside them is
+refused (in `eval-compare` it still steers an automatic judge). Use them when the user names
+a model, or in `eval-compare` to see the result on the configuration the prompt runs on in
+practice. Near a usage limit, automatic selection steps down one tier and says so; `R advise`
+shows what it would pick right now.
 
-## See and stop in-flight runs
+## Reviews
 
-```bash
-python3 scripts/run_review.py runs               # list in-flight reviews
-python3 scripts/run_review.py kill <pid|topic>   # stop one
-```
+- Kinds: `plan`, `design`, or `implementation` for a first round; `fix-round` after applying
+  findings, with `--ask` summarizing the fixes. The reviewer re-verifies each prior finding.
+- `--research` lets the reviewer search the web when a finding depends on an outside fact, such
+  as a release, an advisory, or documented API behavior.
+- Reviews stay on `gpt-6-sol` / `xhigh` and never step down; near a limit they warn. Override
+  with `--model`/`--effort` or `CODEX_REVIEW_MODEL`/`CODEX_REVIEW_EFFORT` (a flag beats the env,
+  the env beats the default). For a deliberately cheap round, such as a trivial fix-round, pass
+  `--model auto --tier light`.
+- Loop to zero: apply the findings you agree with, push back with technical reasoning where the
+  reviewer is wrong, and run a `fix-round` on the same topic until a round returns nothing. A
+  topic typically converges in about six rounds. Under spec-driven development, review the plan,
+  the design, and the implementation each on its own topic.
 
-Every round registers a marker while live. `runs` lists each (pid, topic, model, elapsed, cwd) and
-prunes dead entries; `kill` stops the codex child (ending the spend) then the wrapper. A stop signal
-to a backgrounded run also tears the codex child down, so cancelling the background task stops the
-spend.
+## Eval
 
-## The fix loop (iterate to zero)
+- `eval-advise` returns issues ranked by impact, the full revised prompt, and how to test it.
+  Add `--result` to diagnose from an output the prompt produced.
+- `eval-compare` runs the prompt through codex once, as written. With `--result`, a separate run
+  judges the two blind (shuffled into A and B, outside the repository) and the file states which
+  was which. It takes no `--doc`. The judge shares a model family with codex's answer, so treat a
+  low-confidence win as a tie, or pass `--judge-model` for a different judge.
 
-Codex is a **second, independent reviewer** (one that did not write the code), so it is good at
-catching oversights and reasoning about correctness the author's own pass misses. Get the value by
-looping to zero findings, not by taking one round as the verdict:
+## Running and failures
 
-1. Run a first round (`--kind implementation --topic my-feature`).
-2. Read the findings, apply the ones you agree with, and **push back with technical reasoning where
-   the reviewer is wrong**: a real fix or a justified rebuttal, never a silent skip.
-3. Run `--kind fix-round --topic my-feature --ask "fixed 1,3,4; pushed back on 2 because…"`. The
-   reviewer re-checks each earlier finding against the current tree and surfaces anything new.
-4. Repeat until a round returns nothing. In practice a topic converges in **roughly 6 rounds**;
-   each round is cheaper as findings shrink.
-
-Under spec-driven development, review each stage on its own topic as it is ready: the **plan**
-(`--kind plan`), then the **design** (`--kind design`), then the **implementation**
-(`--kind implementation`), looping each to zero before moving on.
-
-**Keep reasoning high.** The default `gpt-5.6-sol` at `xhigh` effort is slow (tens of minutes a
-round) on purpose: the extra reasoning is what makes the reviewer range across more areas and press
-harder on edge cases. Lower `--effort` only for a deliberately quick, lighter pass.
-
-## Exit codes
-
-- `0` review completed; findings written
-- `1` the Codex call failed (error on stderr; an auth error names `codex login`). Every failure message ends with the codex-cli version in use and whether it is the one this tool was last validated with (`VALIDATED_CODEX_CLI` in `run_review.py`); after a CLI upgrade, a mismatch there is the first suspect.
-- `2` bad arguments (e.g. the topic is not a valid kebab slug)
-- `3` no thread exists for this topic; start with a non-`fix-round` kind
+- **Run every paid command as a background task, not a foreground call.** An `xhigh` review
+  takes tens of minutes and sometimes one to three hours, far past most agent harnesses'
+  synchronous command timeout, which reports a timeout while codex is still working. For a
+  bounded foreground pass, lower the effort.
+- `R runs` lists live jobs; `R kill` stops the codex child first, which ends the spend.
+  Cancelling a background run (or Ctrl-C) does the same at any step, the router included: the
+  run exits 130 and never goes on to a paid call. An interrupted `eval-compare` judge still
+  saves codex's already-paid answer.
+- Exit 2 means bad arguments, refused before any spend: a bad model or effort, an oversized or
+  non-UTF-8 input, or a `--cwd` that is not a git worktree.
+- Exit 3 means a `fix-round` found no thread for the topic; start with a first-round kind.
+- Exit 1 means the codex call failed. stderr says why, nothing was saved, and re-running is
+  safe. An auth error names `codex login`. A timeout says whether codex never started (fix the
+  cause), was still working (raise `CODEX_REVIEW_TIMEOUT` or lower the effort), or wrote
+  non-event output (check the codex-cli version that ends the message).
+- Exit 1 can also mean part of the run was paid and kept. When the output file was
+  unwritable, the paid result is printed to stdout. When `eval-compare`'s judge failed, codex's
+  answer is saved and the last stdout line is its file. Read what was printed before re-running.
+- A kill in the final moment can append a round twice. Check the file's tail and delete the
+  duplicate section.
+- Never edit the state directory (`~/.config/codex-review/state/`, or `CODEX_REVIEW_STATE_DIR`)
+  by hand. If a state file is reported unusable, delete it and start a new thread.
 
 ## Environment variables
 
 - `CODEX_BIN`: path to the `codex` binary (default `codex`)
-- `CODEX_REVIEW_MODEL` / `CODEX_REVIEW_EFFORT`: model / effort fallback (below a CLI flag)
-- `CODEX_REVIEW_OUT_DIR`: findings directory (below `--out-dir`)
+- `CODEX_REVIEW_MODEL` / `CODEX_REVIEW_EFFORT`: a review's model / effort (below a CLI flag)
+- `CODEX_REVIEW_OUT_DIR`: the review findings directory (below `--out-dir`)
 - `CODEX_REVIEW_STATE_DIR`: where thread state lives (default `~/.config/codex-review/state`)
-- `CODEX_REVIEW_TIMEOUT`: per-round timeout in seconds (default 3600). A timeout message says which of three things happened: `codex produced no output at all` means codex never started (a startup or input problem; raising the timeout or lowering the effort will not help, fix the cause and re-run), `codex was still working` means the review is genuinely long (raise `CODEX_REVIEW_TIMEOUT` or lower `--effort`), and `not --json events` means codex wrote something other than its event stream (check the CLI version line that ends the message; a longer timeout will not help).
+- `CODEX_REVIEW_TIMEOUT`: per-call timeout in seconds (default 3600)
+- `CODEX_REVIEW_LABEL_SEED`: an integer that fixes `eval-compare`'s A/B shuffle, for reproducible runs
