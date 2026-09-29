@@ -721,9 +721,19 @@ class RunReviewTest(unittest.TestCase):
     def test_oversized_prompt_is_refused_before_codex(self):
         module = _runner_module()
         with self.assertRaises(SystemExit) as ctx:
-            module.run_codex([str(self.stub), "exec"], "x" * (800 * 1024 + 1), self.repo, 5,
-                             "gpt-6-sol", "low")
+            module.run_codex([str(self.stub), "exec"], "x" * (module.MAX_PROMPT_BYTES + 1),
+                             self.repo, 5, "gpt-6-sol", "low")
         self.assertEqual(ctx.exception.code, 2)
+
+    def test_prompt_cap_fits_one_linux_argument(self):
+        module = _runner_module()
+        # Linux caps one argument at 32 pages, its terminating NUL included; macOS caps only
+        # the whole argument list plus the environment, at 1 MB.
+        self.assertEqual(module.max_prompt_bytes("linux", 4096), 32 * 4096 - 1)
+        self.assertEqual(module.max_prompt_bytes("linux", 65536), 800 * 1024)
+        self.assertEqual(module.max_prompt_bytes("darwin", 4096), 800 * 1024)
+        # One input file at its own limit, plus a template, still fits the prompt cap.
+        self.assertLessEqual(module.MAX_INPUT_BYTES + 32 * 1024, module.MAX_PROMPT_BYTES)
 
     def test_usage_summary_stays_directly_above_the_path(self):
         # Before this change the --usage breakdown printed after the summary, between it and

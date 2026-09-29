@@ -883,9 +883,19 @@ def _timeout_message(timeout, out, stderr_text, codex_bin):
     return "\n".join(lines)
 
 
-# codex takes the prompt as one command-line argument (stdin stays closed on purpose), and
-# macOS caps all arguments plus the environment at 1 MB.
-MAX_PROMPT_BYTES = 800 * 1024
+def max_prompt_bytes(platform, page_size=None):
+    """The largest prompt codex can receive. codex takes the prompt as one command-line
+    argument (stdin stays closed on purpose). macOS caps all arguments plus the environment at
+    1 MB. Linux also caps any single argument at 32 pages (128 KiB on the usual 4 KiB pages),
+    its terminating NUL included, so a larger prompt would fail at exec instead of being
+    refused here, before any spend."""
+    if platform.startswith("linux"):
+        page_size = page_size or os.sysconf("SC_PAGE_SIZE")
+        return min(800 * 1024, 32 * page_size - 1)
+    return 800 * 1024
+
+
+MAX_PROMPT_BYTES = max_prompt_bytes(sys.platform)
 
 
 def check_prompt_size(prompt):
@@ -1380,7 +1390,8 @@ def _research_subcommand(argv):
 
 
 # Each --prompt/--result file; the rendered prompt is capped separately (MAX_PROMPT_BYTES).
-MAX_INPUT_BYTES = 150 * 1024
+# One file at this limit, plus its template, must still fit under that cap.
+MAX_INPUT_BYTES = min(150 * 1024, MAX_PROMPT_BYTES - 32 * 1024)
 
 
 def input_path(cwd, path):

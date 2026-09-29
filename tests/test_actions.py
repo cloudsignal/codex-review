@@ -16,6 +16,19 @@ from datetime import date
 from pathlib import Path
 
 RUNNER = Path(__file__).resolve().parent.parent / "scripts" / "run_review.py"
+
+
+def _runner_limits():
+    """The runner's own size caps. They differ by platform (Linux caps a single argument),
+    so a test that hardcodes one platform's numbers breaks on the other."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("run_review_limits", RUNNER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.MAX_PROMPT_BYTES, module.MAX_INPUT_BYTES
+
+
+MAX_PROMPT, MAX_INPUT = _runner_limits()
 LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
 
 STUB = r"""#!/bin/bash
@@ -430,8 +443,9 @@ class ResearchTest(ActionTestBase):
             ("not-git", ["research", "--topic", "x", "--cwd", str(plain), "--ask", "q"]),
             ("git-dir", ["research", "--topic", "x", "--cwd", str(self.repo / ".git"),
                          "--ask", "q"]),
+            # One argument under the cap; the template carries the rendered prompt over it.
             ("too-big", ["research", "--topic", "x", "--cwd", str(self.repo),
-                         "--ask", "q" * (800 * 1024 + 1)]),
+                         "--ask", "q" * (MAX_PROMPT - 64)]),
         ]
         for name, args in cases:
             with self.subTest(name):
@@ -499,14 +513,14 @@ class EvalAdviseTest(ActionTestBase):
                          [f"{key}_eval-p.json"])
 
     def test_oversized_rendered_prompt_is_refused_before_the_router(self):
-        # Each input is under its own 150 KB cap; with a large ask the rendered prompt is not.
+        # Each input is at its own cap; with the ask the rendered prompt is over its cap.
         # No --tier, so a size check that ran after selection would show a router call.
-        self.prompt.write_bytes(b"p" * (150 * 1024))
+        self.prompt.write_bytes(b"p" * MAX_INPUT)
         result = self.tmp / "out.md"
-        result.write_bytes(b"r" * (150 * 1024))
+        result.write_bytes(b"r" * MAX_INPUT)
         r = self.run_cmd("eval", "advise", "--topic", "huge", "--cwd", str(self.repo),
                          "--prompt", str(self.prompt), "--result", str(result),
-                         "--ask", "a" * (520 * 1024))
+                         "--ask", "a" * max(1, MAX_PROMPT - 2 * MAX_INPUT + 1))
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertEqual(self.calls(), [])
 
@@ -531,12 +545,12 @@ class EvalAdviseTest(ActionTestBase):
         self.assertIn("relative prompt body", self.calls()[0][0][-1])
 
     def test_size_limit_is_inclusive(self):
-        self.prompt.write_bytes(b"x" * (150 * 1024))
+        self.prompt.write_bytes(b"x" * MAX_INPUT)
         self.assertEqual(self.advise().returncode, 0)
 
     def test_bad_inputs_are_refused_before_any_spend(self):
         big = self.tmp / "big.md"
-        big.write_bytes(b"x" * (150 * 1024 + 1))
+        big.write_bytes(b"x" * (MAX_INPUT + 1))
         nul = self.tmp / "nul.md"
         nul.write_bytes(b"a\x00b")
         latin = self.tmp / "latin.md"
@@ -696,8 +710,9 @@ class EvalCompareTest(ActionTestBase):
 
     def test_oversized_judge_prompt_is_refused_before_generation(self):
         # --tier skips the router, so a late check would show exactly one (generate) call.
+        # The criteria reach only the judge prompt, never the generate prompt.
         r = self.compare("--tier", "standard", "--result", str(self.previous),
-                         "--ask", "c" * (810 * 1024))
+                         "--ask", "c" * (MAX_PROMPT - 64))
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertEqual(self.calls(), [])
 

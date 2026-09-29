@@ -105,7 +105,9 @@ shows what it would pick right now.
   run exits 130 and never goes on to a paid call. An interrupted `eval-compare` judge still
   saves codex's already-paid answer.
 - Exit 2 means bad arguments, refused before any spend: a bad model or effort, an oversized or
-  non-UTF-8 input, or a `--cwd` that is not a git worktree.
+  non-UTF-8 input, or a `--cwd` that is not a git worktree. Input files are capped at 150 KiB and
+  the rendered prompt at 800 KiB; on Linux, about 96 KiB and 128 KiB, since codex takes the
+  prompt as one command-line argument.
 - Exit 3 means a `fix-round` found no thread for the topic; start with a first-round kind.
 - Exit 1 means the codex call failed. stderr says why, nothing was saved, and re-running is
   safe. An auth error names `codex login`. A timeout says whether codex never started (fix the

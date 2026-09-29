@@ -164,7 +164,10 @@ python3 scripts/run_review.py eval-compare --topic <slug> --prompt <file> \
   [--result <file>] [--ask "<judging criteria>"] [--tier L] --cwd <worktree>
 ```
 
-`--prompt` is the prompt exactly as it would run; write inline text to a file first. The judge
+`--prompt` is the prompt exactly as it would run; write inline text to a file first. Each
+`--prompt`/`--result` file is capped at 150 KiB and the rendered prompt at 800 KiB. On Linux the
+caps are about 96 KiB and 128 KiB: codex takes the prompt as one command-line argument, and Linux
+limits a single argument to 128 KiB. An input over a cap is refused before any spend. The judge
 shares a model family with codex's answer, so treat a low-confidence win as a tie, or pass
 `--judge-model` for a different judge. `eval advise` and `eval compare` (with a space) also work;
 the hyphenated forms exist because some agent shell guards refuse a bare `eval`.
