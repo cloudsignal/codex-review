@@ -281,5 +281,34 @@ class VerdictTest(unittest.TestCase):
             selection.parse_verdict("the judge rambled")
 
 
+class ReviewDefaultTest(unittest.TestCase):
+    ALL = ("low", "medium", "high", "xhigh", "max", "ultra")
+
+    def test_reviews_run_on_the_latest_sol_when_the_cli_lists_it(self):
+        catalog = Catalog({"gpt-6.1-sol": self.ALL, "gpt-6-sol": self.ALL})
+        self.assertEqual(selection.review_default(catalog, "xhigh"), ("gpt-6.1-sol", None))
+
+    def test_an_older_cli_falls_back_to_gpt_6_sol_and_says_why(self):
+        model, note = selection.review_default(Catalog({"gpt-6-sol": self.ALL}), "xhigh")
+        self.assertEqual(model, "gpt-6-sol")
+        self.assertIn("gpt-6.1-sol", note)
+        self.assertIn("update codex", note)
+
+    def test_listed_without_the_effort_also_falls_back(self):
+        catalog = Catalog({"gpt-6.1-sol": ("low", "medium"), "gpt-6-sol": self.ALL})
+        self.assertEqual(selection.review_default(catalog, "xhigh")[0], "gpt-6-sol")
+        self.assertEqual(selection.review_default(catalog, "medium"), ("gpt-6.1-sol", None))
+
+    def test_an_unreadable_catalog_keeps_the_latest_sol(self):
+        # Nothing says it is missing; codex itself names the problem if it is.
+        self.assertEqual(selection.review_default(Catalog(None), "xhigh"),
+                         ("gpt-6.1-sol", None))
+
+    def test_no_fallback_when_gpt_6_sol_is_missing_too(self):
+        # Validation then refuses naming the model the run actually asked for.
+        catalog = Catalog({"gpt-6-luna": self.ALL})
+        self.assertEqual(selection.review_default(catalog, "xhigh"), ("gpt-6.1-sol", None))
+
+
 if __name__ == "__main__":
     unittest.main()

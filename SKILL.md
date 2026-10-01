@@ -9,8 +9,9 @@ license: MIT
 One runner drives [OpenAI Codex](https://github.com/openai/codex) in a **read-only** sandbox, for
 code reviews, prompt evals, and web research. The model runs no commands that write to your tree.
 The tool itself writes only its output file and its thread state, and sends the material under
-review to Codex. Reviews run on `gpt-6-sol` at `xhigh`. Every other action picks its own model and
-effort, and costs less when the task is small or the subscription is near its limit.
+review to Codex. Reviews run on `gpt-6.1-sol` at `xhigh` (`gpt-6-sol` on a codex CLI too old to
+list it). Every other action picks its own model and effort, and costs less when the task is small
+or the subscription is near its limit.
 
 ## Requirements
 
@@ -76,10 +77,12 @@ shows what it would pick right now.
   findings, with `--ask` summarizing the fixes. The reviewer re-verifies each prior finding.
 - `--research` lets the reviewer search the web when a finding depends on an outside fact, such
   as a release, an advisory, or documented API behavior.
-- Reviews stay on `gpt-6-sol` / `xhigh` and never step down; near a limit they warn. Override
-  with `--model`/`--effort` or `CODEX_REVIEW_MODEL`/`CODEX_REVIEW_EFFORT` (a flag beats the env,
-  the env beats the default). For a deliberately cheap round, such as a trivial fix-round, pass
-  `--model auto --tier light`.
+- Reviews stay on `gpt-6.1-sol` / `xhigh` and never step down; near a limit they warn. On a codex
+  CLI that does not list `gpt-6.1-sol` (0.159.2 does, 0.156.1 does not), a review runs on
+  `gpt-6-sol` and says so; update codex to get the better reviewer. Override with
+  `--model`/`--effort` or `CODEX_REVIEW_MODEL`/`CODEX_REVIEW_EFFORT` (a flag beats the env, the
+  env beats the default); a model you name is never swapped. For a deliberately cheap round, such
+  as a trivial fix-round, pass `--model auto --tier light`.
 - Loop to zero: apply the findings you agree with, push back with technical reasoning where the
   reviewer is wrong, and run a `fix-round` on the same topic until a round returns nothing. A
   topic typically converges in about six rounds. Under spec-driven development, review the plan,

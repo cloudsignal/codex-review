@@ -40,7 +40,8 @@ drives `codex` in a **read-only** sandbox: the model runs no commands that write
   one), check the choice against your live model catalog, and step down one tier near a usage
   limit. `advise` previews the choice for free.
 - **Selectable reviewer.** `--model` and `--effort` (with `CODEX_REVIEW_MODEL` /
-  `CODEX_REVIEW_EFFORT` env fallback); the strong default is `gpt-6-sol` at `xhigh`.
+  `CODEX_REVIEW_EFFORT` env fallback); the strong default is `gpt-6.1-sol` at `xhigh`, with
+  `gpt-6-sol` on a codex CLI that does not list it yet.
 - **Token-usage reporting.** A one-line usage summary on every run, with `--usage [text|json]` for a
   fuller breakdown.
 - **Subscription-limits check.** `limits` reads your plan usage off disk (no tokens, no network) and
@@ -77,9 +78,9 @@ Each round is one turn of a converging loop. In practice it takes **~6 rounds** 
 Keep the same `--topic` across the loop so the thread remembers earlier findings and checks whether
 each is resolved.
 
-**Keep reasoning high.** The default `gpt-6-sol` at `xhigh` is slow (tens of minutes a round) on
-purpose: the extra reasoning is what drives the reviewer to range across more areas and press harder
-on edge cases, which is the whole value. Reviews never step down on their own. Lower `--effort`, or
+**Keep reasoning high.** The default `gpt-6.1-sol` at `xhigh` is slow (minutes to tens of minutes a
+round) on purpose: the extra reasoning is what drives the reviewer to range across more areas and
+press harder on edge cases, which is the whole value. Reviews never step down on their own. Lower `--effort`, or
 pass `--model auto --tier light`, only when you deliberately want a quick, lighter pass.
 
 ## Requirements
@@ -89,7 +90,7 @@ pass `--model auto --tier light`, only when you deliberately want a quick, light
 - Python 3.9+ (standard library only)
 - The [OpenAI Codex CLI](https://github.com/openai/codex) on your `PATH`, authenticated once with
   `codex login`
-- Last validated end to end with codex-cli 0.156.1 (`VALIDATED_CODEX_CLI` in the script). Newer
+- Last validated end to end with codex-cli 0.159.2 (`VALIDATED_CODEX_CLI` in the script). Newer
   releases usually work; every failure message reports the version in use so a CLI change is
   visible at once.
 
@@ -174,8 +175,10 @@ the hyphenated forms exist because some agent shell guards refuse a bare `eval`.
 
 ### Model selection
 
-Reviews use `gpt-6-sol` at `xhigh` unless you say otherwise. Research and evals select
-automatically: pass `--tier` (free, and you know the task best), or omit it and a cheap router call
+Reviews use `gpt-6.1-sol` at `xhigh` unless you say otherwise. On a codex CLI that does not list
+`gpt-6.1-sol` (0.159.2 does, 0.156.1 does not), a review falls back to `gpt-6-sol` and says so on
+stderr and in the review file; a model you name with `--model` or `CODEX_REVIEW_MODEL` is never
+swapped. Research and evals select automatically: pass `--tier` (free, and you know the task best), or omit it and a cheap router call
 (`gpt-6-luna` at `low`) picks the tier.
 
 | Action | light | standard | deep |
@@ -202,7 +205,7 @@ nothing.
 ### Common options
 
 ```
---model <codex-model>       # a review's default: gpt-6-sol; 'auto' selects from the review ladder
+--model <codex-model>       # a review's default: gpt-6.1-sol; 'auto' selects from the review ladder
 --effort <low|medium|high|xhigh|...>   # a review's default: xhigh; checked against the live catalog
 --tier <light|standard|deep>           # with automatic selection: skip the router
 --out-dir <dir>             # default: .codex-review/<reviews|research|evals>/ (relative to --cwd)

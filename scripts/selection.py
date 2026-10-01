@@ -13,7 +13,11 @@ TIERS = ("light", "standard", "deep")
 # Used only when `codex debug models` cannot be read; a live catalog validates per model.
 STATIC_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 
-REVIEW_MODEL = "gpt-6-sol"
+# Reviews run on the latest workhorse. codex-cli 0.159.2 lists it and 0.156.1 does not, so on a
+# CLI that does not list it a pinned review falls back to REVIEW_FALLBACK_MODEL instead of
+# failing (review_default).
+REVIEW_MODEL = "gpt-6.1-sol"
+REVIEW_FALLBACK_MODEL = "gpt-6-sol"
 REVIEW_EFFORT = "xhigh"
 ROUTER_MODEL = "gpt-6-luna"
 ROUTER_EFFORT = "low"
@@ -86,6 +90,21 @@ def parse_catalog(text):
                     efforts.append(effort)
         out[slug] = tuple(efforts)
     return out or None
+
+
+def review_default(catalog, effort):
+    """The pinned review model for this catalog, as (model, note). REVIEW_MODEL, unless a live
+    catalog lacks it at `effort` but has REVIEW_FALLBACK_MODEL there (an older codex CLI): then
+    the fallback, with a note saying why. An unreadable catalog keeps REVIEW_MODEL, since
+    nothing says it is missing. Only the default falls back; a model the caller names is
+    validated as named."""
+    if not catalog.live or catalog.supports(REVIEW_MODEL, effort):
+        return REVIEW_MODEL, None
+    if not catalog.supports(REVIEW_FALLBACK_MODEL, effort):
+        return REVIEW_MODEL, None
+    return REVIEW_FALLBACK_MODEL, (
+        "%s is not in this codex CLI's model list, so this review runs on %s; update codex "
+        "to review with %s" % (REVIEW_MODEL, REVIEW_FALLBACK_MODEL, REVIEW_MODEL))
 
 
 def validate(model, effort, catalog):

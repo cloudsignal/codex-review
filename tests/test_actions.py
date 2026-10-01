@@ -74,7 +74,7 @@ if [ -n "$file" ]; then cat "$file" > "$out"; else printf 'STUB %s OUTPUT\n' "$r
 """
 
 
-def catalog_text(astra=True):
+def catalog_text(astra=True, latest=True):
     models = [
         {"slug": "gpt-6-sol", "supported_reasoning_levels": [{"effort": e} for e in LEVELS]},
         {"slug": "gpt-6-luna",
@@ -82,6 +82,9 @@ def catalog_text(astra=True):
     ]
     if astra:
         models.insert(0, {"slug": "gpt-6-astra",
+                          "supported_reasoning_levels": [{"effort": e} for e in LEVELS]})
+    if latest:  # what codex-cli 0.159.2 and newer list
+        models.insert(0, {"slug": "gpt-6.1-sol",
                           "supported_reasoning_levels": [{"effort": e} for e in LEVELS]})
     return json.dumps({"models": models})
 
@@ -346,7 +349,7 @@ class ResearchTest(ActionTestBase):
         text = self.out_file("reviews", "rv", "codex-review").read_text()
         self.assertTrue(heading.search(text), text)  # tools that parse round headings still match
         self.assertIn(f"## Round 1 ({date.today().isoformat()}, plan)\n\n"
-                      "Model: gpt-6-sol / xhigh (pinned review default)", text)
+                      "Model: gpt-6.1-sol / xhigh (pinned review default)", text)
         self.assertIn(f"## Round 2 ({date.today().isoformat()}, fix-round)\n\n"
                       "Model: gpt-6-luna / low (set on the command line)", text)
         self.assertEqual(self.model_of(self.calls()[-1][0]), "gpt-6-luna")  # on resume too
@@ -362,7 +365,7 @@ class ResearchTest(ActionTestBase):
                          "--cwd", str(self.repo))
         self.assertEqual(r.returncode, 0, r.stderr)
         argv = self.calls()[-1][0]
-        self.assertEqual((self.model_of(argv), self.effort_of(argv)), ("gpt-6-sol", "xhigh"))
+        self.assertEqual((self.model_of(argv), self.effort_of(argv)), ("gpt-6.1-sol", "xhigh"))
         self.assertIn("near its limit", r.stderr)
 
     def test_stop_signal_during_the_router_stops_the_run(self):
@@ -913,7 +916,14 @@ class AdviseTest(ActionTestBase):
         self.assertEqual(self.calls(), [])
         for action in ("review", "research", "eval-advise", "eval-compare"):
             self.assertIn(action, r.stdout)
-        self.assertIn("pick: gpt-6-sol / xhigh", r.stdout)
+        self.assertIn("pick: gpt-6.1-sol / xhigh", r.stdout)
+
+    def test_advise_shows_the_review_fallback_on_an_older_cli(self):
+        self.catalog.write_text(catalog_text(latest=False))
+        pick = self.advise_json("review")["actions"]["review"][0]["pick"]
+        self.assertEqual((pick["model"], pick["effort"]), ("gpt-6-sol", "xhigh"))
+        self.assertTrue(any("gpt-6.1-sol" in note for note in pick["notes"]), pick)
+        self.assertFalse(any("exit 2" in note for note in pick["notes"]), pick)
 
     def test_pick_applies_the_headroom_step_down(self):
         self.write_snapshot(86.0, time.time() + 3600)

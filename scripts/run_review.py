@@ -39,7 +39,9 @@ PRUNE_DAYS = 30
 
 # A review's reviewer + effort. Reviews stay pinned to these unless a flag, the
 # CODEX_REVIEW_MODEL/CODEX_REVIEW_EFFORT env vars, or --model auto says otherwise.
-# Precedence: CLI > env > default. Every other action selects automatically (selection.py).
+# Precedence: CLI > env > default. On a codex CLI that does not list the default model, the
+# default (and only the default) falls back to selection.REVIEW_FALLBACK_MODEL. Every other
+# action selects automatically (selection.py).
 DEFAULT_MODEL = selection.REVIEW_MODEL
 DEFAULT_EFFORT = selection.REVIEW_EFFORT
 # The effort list used when the live model catalog cannot be read.
@@ -787,7 +789,7 @@ def run_round(*, action, cwd, codex, timeout, origin, branch, topic, state, prom
 # pinned above; the CLI is whatever is installed, and a CLI change is the usual cause of a
 # break no flag explains (0.153.3 began reading a non-terminal stdin before its first turn).
 # Every failure message names the running version and whether it is this one.
-VALIDATED_CODEX_CLI = "0.156.1"
+VALIDATED_CODEX_CLI = "0.159.2"
 
 
 def codex_cli_version(codex_bin):
@@ -1646,6 +1648,10 @@ def build_advice(action_names, tier, catalog, headroom, now):
                 notes = ["from " + " and ".join(from_env) if from_env
                          else "pinned review default",
                          "the ladder applies only with --model auto"]
+                if not env("CODEX_REVIEW_MODEL", ""):
+                    model, fallback_note = selection.review_default(catalog, effort)
+                    if fallback_note:
+                        notes.append(fallback_note)
                 if catalog.live and not catalog.supports(model, effort):
                     notes.append(f"{model} / {effort} is not in the codex catalog: a review "
                                  "would exit 2")
@@ -1743,10 +1749,11 @@ def main():
                         help="where findings are written, relative to --cwd (default "
                              "%s, or CODEX_REVIEW_OUT_DIR)" % DEFAULT_OUT_DIR)
     parser.add_argument("--model", default=None,
-                        help="reviewer model (default %s, or CODEX_REVIEW_MODEL); the "
-                             "default is heavier reasoning for a better review, but any "
-                             "codex model may be selected; 'auto' selects from the review "
-                             "ladder (see --tier)" % DEFAULT_MODEL)
+                        help="reviewer model (default %s, or %s on a codex CLI that "
+                             "does not list it; or CODEX_REVIEW_MODEL); the default is heavier "
+                             "reasoning for a better review, but any codex model may be "
+                             "selected; 'auto' selects from the review ladder (see --tier)"
+                             % (DEFAULT_MODEL, selection.REVIEW_FALLBACK_MODEL))
     parser.add_argument("--effort", default=None,
                         help="reasoning effort %s (default %s, or CODEX_REVIEW_EFFORT)"
                              % ("|".join(EFFORTS), DEFAULT_EFFORT))
@@ -1796,6 +1803,7 @@ def main():
             catalog=catalog, route=route)
         print(f"selected {args.model} / {args.effort} ({model_source})")
     else:
+        model_named = bool(args.model) or bool(env("CODEX_REVIEW_MODEL", ""))
         model_source = describe_source(
             "--model" if args.model
             else "CODEX_REVIEW_MODEL" if env("CODEX_REVIEW_MODEL", "") else None,
@@ -1803,6 +1811,11 @@ def main():
             else "CODEX_REVIEW_EFFORT" if env("CODEX_REVIEW_EFFORT", "") else None,
             default="pinned review default", fallback="the pinned default")
         args.model, args.effort = resolve_model_effort(args.model, args.effort)
+        if not model_named:
+            args.model, fallback_note = selection.review_default(catalog, args.effort)
+            if fallback_note:
+                print(f"note: {fallback_note}", file=sys.stderr)
+                model_source += f"; {selection.REVIEW_MODEL} is not in this codex CLI"
         validate_choice(args.model, args.effort, catalog)
         warn_if_near_limit(args.model, args.effort)
 

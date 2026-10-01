@@ -116,6 +116,12 @@ printf 'STUB REVIEW FINDINGS\\n' > "$out"
 
 LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
 CATALOG = json.dumps({"models": [
+    {"slug": "gpt-6.1-sol", "supported_reasoning_levels": [{"effort": e} for e in LEVELS]},
+    {"slug": "gpt-6-sol", "supported_reasoning_levels": [{"effort": e} for e in LEVELS]},
+    {"slug": "gpt-6-luna", "supported_reasoning_levels": [{"effort": e} for e in LEVELS[:-1]]},
+]})
+# What a codex CLI older than gpt-6.1-sol lists.
+OLD_CATALOG = json.dumps({"models": [
     {"slug": "gpt-6-sol", "supported_reasoning_levels": [{"effort": e} for e in LEVELS]},
     {"slug": "gpt-6-luna", "supported_reasoning_levels": [{"effort": e} for e in LEVELS[:-1]]},
 ]})
@@ -216,7 +222,7 @@ class RunReviewTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         argv = self.stub_log.read_text().splitlines()
         self.assertIn("-m", argv)
-        self.assertIn("gpt-6-sol", argv)
+        self.assertIn("gpt-6.1-sol", argv)
         self.assertIn('model_reasoning_effort="xhigh"', argv)
         self.assertIn('sandbox_mode="read-only"', argv)
         self.assertIn("--json", argv)
@@ -559,7 +565,7 @@ class RunReviewTest(unittest.TestCase):
         argv = self.stub_log.read_text().splitlines()
         self.assertIn("cheap-model", argv)
         self.assertIn('model_reasoning_effort="low"', argv)
-        self.assertNotIn("gpt-6-sol", argv)
+        self.assertNotIn("gpt-6.1-sol", argv)
         self.assertNotIn('model_reasoning_effort="xhigh"', argv)
 
     def test_cli_model_effort_beats_env(self):
@@ -601,9 +607,9 @@ class RunReviewTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('"input_tokens": 1200', r.stdout)
 
-    def catalog_env(self):
+    def catalog_env(self, text=CATALOG):
         path = self.tmp / "catalog.json"
-        path.write_text(CATALOG)
+        path.write_text(text)
         return {"STUB_CATALOG": str(path)}
 
     def write_snapshot(self, used_percent, resets_at):
@@ -623,10 +629,30 @@ class RunReviewTest(unittest.TestCase):
         effort = next(a for a in argv if a.startswith("model_reasoning_effort="))
         return argv[argv.index("-m") + 1], effort.split('"')[1]
 
-    def test_review_default_is_gpt_6_sol_at_xhigh(self):
+    def test_review_default_is_gpt_6_1_sol_at_xhigh(self):
         r = self.run_review("--kind", "plan", env_extra=self.catalog_env())
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.model_effort(), ("gpt-6.1-sol", "xhigh"))
+        self.assertNotIn("update codex", r.stderr)
+
+    def test_an_older_cli_reviews_on_gpt_6_sol_and_says_why(self):
+        r = self.run_review("--kind", "plan", env_extra=self.catalog_env(OLD_CATALOG))
+        self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.model_effort(), ("gpt-6-sol", "xhigh"))
+        self.assertIn("update codex", r.stderr)
+        self.assertIn("Model: gpt-6-sol / xhigh (pinned review default; gpt-6.1-sol is not in "
+                      "this codex CLI)", self.expected_findings().read_text())
+
+    def test_an_explicit_gpt_6_1_sol_is_refused_not_swapped(self):
+        # Only the default falls back. A model the caller names runs as named or not at all.
+        for name, extra in (("flag", {}), ("env", {"CODEX_REVIEW_MODEL": "gpt-6.1-sol"})):
+            with self.subTest(name):
+                args = ("--model", "gpt-6.1-sol") if name == "flag" else ()
+                r = self.run_review("--kind", "plan", *args, topic=f"explicit-{name}",
+                                    env_extra={**self.catalog_env(OLD_CATALOG), **extra})
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("gpt-6.1-sol", r.stderr)
+                self.assertEqual(self.stub_log.read_text(), "")
 
     def test_effort_is_checked_against_the_chosen_model(self):
         # ultra is valid for sol and not luna: one global effort list lets both through.
@@ -657,7 +683,7 @@ class RunReviewTest(unittest.TestCase):
         r = self.run_review("--kind", "plan", env_extra=self.catalog_env())
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("near its limit", r.stderr)
-        self.assertEqual(self.model_effort(), ("gpt-6-sol", "xhigh"))
+        self.assertEqual(self.model_effort(), ("gpt-6.1-sol", "xhigh"))
 
     def test_warning_line_is_inclusive_and_ignores_reset_windows(self):
         cases = [(80.0, 3600, "at-line", True), (79.9, 3600, "below", False),
@@ -685,7 +711,7 @@ class RunReviewTest(unittest.TestCase):
     def test_review_default_is_sol_at_xhigh(self):
         module = _runner_module()
         with mock.patch.dict(os.environ, {"CODEX_REVIEW_MODEL": "", "CODEX_REVIEW_EFFORT": ""}):
-            self.assertEqual(module.resolve_model_effort(None, None), ("gpt-6-sol", "xhigh"))
+            self.assertEqual(module.resolve_model_effort(None, None), ("gpt-6.1-sol", "xhigh"))
 
     def test_web_search_is_disabled_explicitly_by_default(self):
         r = self.run_review("--kind", "plan")
@@ -697,7 +723,7 @@ class RunReviewTest(unittest.TestCase):
         r = self.run_review("--kind", "plan", "--research", env_extra=self.catalog_env())
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('web_search="live"', self.argv())
-        self.assertEqual(self.model_effort(), ("gpt-6-sol", "xhigh"))
+        self.assertEqual(self.model_effort(), ("gpt-6.1-sol", "xhigh"))
         self.assertIn("Web search is available for this round", self.stub_log.read_text())
 
     def test_network_in_inspect_mode_points_at_research(self):
